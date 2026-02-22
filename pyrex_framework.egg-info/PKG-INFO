@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: pyrex-framework
+Version: 0.1.0
+Summary: Python JSX-like framework that transpiles .pyx files to HTML + vanilla JS
+Requires-Python: >=3.11
