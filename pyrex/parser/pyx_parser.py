@@ -29,7 +29,7 @@ class UseEffectCall:
     deps: list[str]      # dependency variable names
 
 
-@dataclass 
+@dataclass
 class ComponentDef:
     name: str
     params: list[str]           # prop names
@@ -38,6 +38,7 @@ class ComponentDef:
     use_effects: list[UseEffectCall] = field(default_factory=list)
     is_server: bool = False     # decorated with @server_component
     is_root: bool = False       # this is the page root
+    is_layout: bool = False     # decorated with @layout
 
 
 @dataclass
@@ -96,12 +97,13 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
         name = node.name
         decorators = [_get_decorator_name(d) for d in node.decorator_list]
 
-        is_component = name[0].isupper() or 'component' in decorators or 'page' in decorators
+        is_component = name[0].isupper() or 'component' in decorators or 'page' in decorators or 'layout' in decorators
         if not is_component:
             continue
 
         is_root = 'page' in decorators
         is_server = 'server_component' in decorators
+        is_layout = 'layout' in decorators
 
         params = [arg.arg for arg in node.args.args]
 
@@ -122,6 +124,7 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
             use_effects=use_effects,
             is_server=is_server,
             is_root=is_root,
+            is_layout=is_layout,
         )
         components.append(comp)
 

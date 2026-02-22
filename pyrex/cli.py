@@ -4,9 +4,9 @@ Pyrex CLI
 Registered as the `pyrex` command via pyproject.toml [project.scripts].
 After `pip install -e .` you can run:
 
-    pyrex build app/page.pyx
-    pyrex serve app/page.pyx
-    pyrex serve app/page.pyx 8080
+    pyrex build app/page.pyx           transpile a single file to HTML
+    pyrex serve app/                   start dev server (scans for page.pyx files)
+    pyrex serve app/ 8080              on a custom port
 """
 
 import sys
@@ -21,8 +21,8 @@ def main():
         print("Pyrex - Python JSX Framework")
         print("")
         print("Usage:")
-        print("  pyrex build <file.pyx>           transpile to HTML")
-        print("  pyrex serve <file.pyx> [port]    start dev server (default port 3000)")
+        print("  pyrex build <file.pyx>          transpile a single file to HTML")
+        print("  pyrex serve <directory> [port]  start dev server (default port 3000)")
         sys.exit(0)
 
     command = args[0]
@@ -49,14 +49,15 @@ def main():
 
     elif command == "serve":
         if len(args) < 2:
-            print("Usage: pyrex serve <file.pyx> [port]")
+            print("Usage: pyrex serve <directory> [port]")
             sys.exit(1)
-        filepath = args[1]
-        if not os.path.exists(filepath):
-            print(f"Error: file not found: {filepath}")
+        path = args[1]
+        if not os.path.isdir(path):
+            print(f"Error: expected a directory, got: {path}")
+            print("Usage: pyrex serve app/")
             sys.exit(1)
         port = int(args[2]) if len(args) > 2 else 3000
-        serve(filepath, port=port)
+        serve(path, port=port)
 
     else:
         print(f"Unknown command: '{command}'")

@@ -1,95 +1,181 @@
 """
 Pyrex Engine
 
-The main entry point for the framework.
-- build(filepath) → HTML string
-- serve(filepath) → starts a dev HTTP server
+Entry points:
+- build_file(filepath) → HTML string   (single-file build, used by `pyrex build`)
+- build_source(source) → HTML string   (in-memory build, useful for testing)
+- build_route(page_filepath, layout_filepath) → HTML string  (used by serve)
+- serve(directory)     → starts a multi-route dev HTTP server
 """
 
 import os
-import sys
 from pathlib import Path
 
 from pyrex.parser.pyx_parser import parse_pyx_file, parse_pyx_source
 from pyrex.transpiler.transpiler import Transpiler
 
 
+# ── Single-file build helpers (unchanged, used by `pyrex build`) ────────────
+
 def build_file(filepath: str) -> str:
-    """
-    Parse a .pyx file and transpile it to a complete HTML page.
-    Returns the HTML as a string.
-    """
+    """Parse a .pyx file and transpile it to a complete HTML page."""
     module = parse_pyx_file(filepath)
     transpiler = Transpiler(module)
     return transpiler.transpile()
 
 
 def build_source(source: str) -> str:
-    """
-    Parse a .pyx source string and transpile to HTML.
-    Useful for testing.
-    """
+    """Parse a .pyx source string and transpile to HTML. Useful for testing."""
     module = parse_pyx_source(source)
     transpiler = Transpiler(module)
     return transpiler.transpile()
 
 
-def serve(filepath: str, port: int = 3000, watch: bool = True):
+# ── Route build helper (used by serve) ──────────────────────────────────────
+
+def build_route(page_filepath: str, layout_filepath: str | None = None) -> str:
     """
-    Start a dev server that serves the transpiled .pyx file.
-    Watches for changes and rebuilds automatically.
-    Browser tabs connected to /__pyrex_reload receive an SSE message
-    on each rebuild and reload automatically.
+    Transpile a page.pyx, optionally wrapped in a layout component.
+
+    If layout_filepath is given and contains a @layout component, the page body
+    is injected as the {children} prop of the layout before wrapping in HTML.
+    """
+    page_module = parse_pyx_file(page_filepath)
+    pt = Transpiler(page_module)
+
+    if not layout_filepath:
+        return pt.transpile()
+
+    layout_module = parse_pyx_file(layout_filepath)
+    layout_comp = next((c for c in layout_module.components if c.is_layout), None)
+    if not layout_comp:
+        return pt.transpile()   # layout.pyx has no @layout component — ignore
+
+    page_root = pt.component_map[page_module.root_component]
+    page_body = pt._render_component(page_root, {})
+
+    lt = Transpiler(layout_module)
+    layout_body = lt._render_component(layout_comp, {"children": page_body})
+
+    all_js = (pt._build_js_runtime() + "\n"
+              + pt._build_all_component_js() + "\n"
+              + lt._build_all_component_js())
+    return pt._wrap_html_page(layout_body, all_js)
+
+
+# ── Directory scanning ───────────────────────────────────────────────────────
+
+def _discover_routes(app_dir: str) -> dict[str, str]:
+    """
+    Recursively find all page.pyx files under app_dir and map them to URL routes.
+
+    app/page.pyx           → /
+    app/about/page.pyx     → /about
+    app/blog/post/page.pyx → /blog/post
+    """
+    app_path = Path(app_dir)
+    routes: dict[str, str] = {}
+    for pyx_file in sorted(app_path.rglob("page.pyx")):
+        rel = pyx_file.parent.relative_to(app_path)
+        route = "/" + str(rel).replace("\\", "/") if str(rel) != "." else "/"
+        routes[route] = str(pyx_file.resolve())
+    return routes
+
+
+def _find_layout(app_dir: str) -> str | None:
+    """Return the absolute path to app/layout.pyx, or None if it doesn't exist."""
+    p = Path(app_dir) / "layout.pyx"
+    return str(p.resolve()) if p.exists() else None
+
+
+# ── Dev server ───────────────────────────────────────────────────────────────
+
+def serve(directory: str, port: int = 3000, watch: bool = True):
+    """
+    Start a dev server that serves all page.pyx files found under `directory`.
+
+    Route mapping:  directory/page.pyx          → /
+                    directory/about/page.pyx     → /about
+                    directory/blog/post/page.pyx → /blog/post
+
+    An optional directory/layout.pyx (must contain a @layout component) wraps
+    every page. Changing layout.pyx triggers a rebuild of all routes.
+
+    Each browser tab connected to /__pyrex_reload receives an SSE message on
+    any rebuild and reloads automatically.
     """
     from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
     import threading
     import queue
     import time
 
-    filepath = os.path.abspath(filepath)
-    cache = {"html": "", "mtime": 0}
+    directory = os.path.abspath(directory)
+    routes = _discover_routes(directory)
+    layout_path = _find_layout(directory)
+
+    if not routes:
+        print(f"  No page.pyx files found under: {directory}")
+        return
+
+    # Per-route cache
+    route_cache: dict[str, dict] = {route: {"html": "", "mtime": 0.0} for route in routes}
+    layout_mtime: dict[str, float] = {"v": 0.0}
 
     # SSE client registry — one Queue per open browser tab
     _sse_clients: list[queue.Queue] = []
     _sse_lock = threading.Lock()
 
-    # Injected into every served HTML page (dev-only, never written to disk)
+    # Injected into every served page (dev-only, never written to disk)
     _SSE_SCRIPT = (
         "<script>new EventSource('/__pyrex_reload')"
         ".onmessage=function(){location.reload()};</script>"
     )
 
-    def rebuild():
+    def _rebuild_route(route: str) -> bool:
+        filepath = routes[route]
         start = time.monotonic()
         try:
-            html = build_file(filepath)
-            cache["html"] = html
-            cache["mtime"] = os.path.getmtime(filepath)
+            html = build_route(filepath, layout_path)
+            route_cache[route]["html"] = html
+            route_cache[route]["mtime"] = os.path.getmtime(filepath)
             ms = int((time.monotonic() - start) * 1000)
-            print(f"  ✓ Built in {ms}ms")
-            # Notify every open SSE connection
-            with _sse_lock:
-                clients = list(_sse_clients)
-            for q in clients:
-                try:
-                    q.put("data: reload\n\n")
-                except Exception:
-                    pass
-            if clients:
-                print(f"  ✓ Browser reloaded")
+            print(f"  ✓ {route}  built in {ms}ms")
             return True
         except Exception as e:
-            cache["html"] = f"<pre style='color:red'>Build error:\n{e}</pre>"
-            print(f"  ✗ Build error: {e}")
+            route_cache[route]["html"] = (
+                f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"
+            )
+            print(f"  ✗ {route}  build error: {e}")
             return False
 
-    rebuild()
+    def _broadcast_reload():
+        with _sse_lock:
+            clients = list(_sse_clients)
+        for q in clients:
+            try:
+                q.put("data: reload\n\n")
+            except Exception:
+                pass
+        if clients:
+            print("  ✓ Browser reloaded")
+
+    # Initial build — all routes
+    for route in routes:
+        _rebuild_route(route)
+
+    # Seed layout mtime so the watcher doesn't immediately trigger a rebuild
+    if layout_path:
+        try:
+            layout_mtime["v"] = os.path.getmtime(layout_path)
+        except FileNotFoundError:
+            pass
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == '/':
-                # Inject SSE client script before </body>
-                html = cache["html"].replace("</body>", _SSE_SCRIPT + "\n</body>", 1)
+            if self.path in route_cache:
+                html = route_cache[self.path]["html"].replace(
+                    "</body>", _SSE_SCRIPT + "\n</body>", 1
+                )
                 data = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -97,7 +183,7 @@ def serve(filepath: str, port: int = 3000, watch: bool = True):
                 self.end_headers()
                 self.wfile.write(data)
 
-            elif self.path == '/__pyrex_reload':
+            elif self.path == "/__pyrex_reload":
                 # Hold the connection open and stream reload events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -129,18 +215,39 @@ def serve(filepath: str, port: int = 3000, watch: bool = True):
                 self.end_headers()
 
         def log_message(self, format, *args):
-            pass  # suppress default logging
+            pass  # suppress default request logging
 
     def watcher():
         while True:
             time.sleep(0.5)
-            try:
-                mtime = os.path.getmtime(filepath)
-                if mtime != cache["mtime"]:
-                    print(f"\n  File changed, rebuilding...")
-                    rebuild()
-            except FileNotFoundError:
-                pass
+            rebuilt = []
+
+            # Check each page file for changes
+            for route, filepath in routes.items():
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    if mtime != route_cache[route]["mtime"]:
+                        print(f"\n  File changed ({route}), rebuilding...")
+                        if _rebuild_route(route):
+                            rebuilt.append(route)
+                except FileNotFoundError:
+                    pass
+
+            # Check layout — a change requires rebuilding every route
+            if layout_path:
+                try:
+                    mtime = os.path.getmtime(layout_path)
+                    if mtime != layout_mtime["v"]:
+                        layout_mtime["v"] = mtime
+                        print("\n  layout.pyx changed, rebuilding all routes...")
+                        for route in routes:
+                            if _rebuild_route(route):
+                                rebuilt.append(route)
+                except FileNotFoundError:
+                    pass
+
+            if rebuilt:
+                _broadcast_reload()
 
     if watch:
         t = threading.Thread(target=watcher, daemon=True)
@@ -156,9 +263,13 @@ def serve(filepath: str, port: int = 3000, watch: bool = True):
             super().handle_error(request, client_address)
 
     server = _Server(("", port), Handler)
+
+    route_list = "  ".join(routes.keys())
     print(f"\n  🔥 Pyrex dev server")
     print(f"  → http://localhost:{port}")
-    print(f"  → Watching: {filepath}")
+    print(f"  → Routes: {route_list}")
+    if layout_path:
+        print(f"  → Layout: {layout_path}")
     print(f"  → Press Ctrl+C to stop\n")
 
     try:
