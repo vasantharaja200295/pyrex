@@ -11,3 +11,7 @@ __pycache__/
 # Transpiler output
 app/*.html
 *.html
+
+
+CLAUDE.md
+architecture.md
