@@ -215,6 +215,6 @@ def _parse_prop_name(src: str, pos: int) -> tuple[str, int]:
 
 
 def _skip_whitespace(src: str, pos: int) -> int:
-    while pos < len(src) and src[pos] in (' ', '\t', '\n', '\r'):
+    while pos < len(src) and src[pos].isspace():
         pos += 1
     return pos

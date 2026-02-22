@@ -55,7 +55,7 @@ class PyxModule:
 
 
 def parse_pyx_file(filepath: str) -> PyxModule:
-    with open(filepath) as f:
+    with open(filepath, encoding="utf-8") as f:
         source = f.read()
     return parse_pyx_source(source)
 
