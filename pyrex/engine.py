@@ -146,7 +146,16 @@ def serve(filepath: str, port: int = 3000, watch: bool = True):
         t = threading.Thread(target=watcher, daemon=True)
         t.start()
 
-    server = ThreadingHTTPServer(("", port), Handler)
+    class _Server(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            # Silently ignore aborted connections — common on Windows when
+            # a browser tab is closed or keep-alive sockets are recycled.
+            import sys
+            if isinstance(sys.exc_info()[1], ConnectionAbortedError):
+                return
+            super().handle_error(request, client_address)
+
+    server = _Server(("", port), Handler)
     print(f"\n  🔥 Pyrex dev server")
     print(f"  → http://localhost:{port}")
     print(f"  → Watching: {filepath}")
