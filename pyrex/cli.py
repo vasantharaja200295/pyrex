@@ -48,16 +48,23 @@ def main():
             sys.exit(1)
 
     elif command == "serve":
-        if len(args) < 2:
-            print("Usage: pyrex serve <directory> [port]")
+        # Directory is optional — defaults to app/
+        # Accepted forms: pyrex serve  |  pyrex serve 8080  |  pyrex serve myapp/  |  pyrex serve myapp/ 8080
+        directory = "app"
+        port = 3000
+        rest = args[1:]
+        if rest:
+            if rest[0].isdigit():
+                port = int(rest[0])
+            else:
+                directory = rest[0]
+                if len(rest) > 1:
+                    port = int(rest[1])
+        if not os.path.isdir(directory):
+            print(f"Error: directory not found: {directory!r}")
+            print("Create an app/ directory or pass a custom path: pyrex serve <dir>")
             sys.exit(1)
-        path = args[1]
-        if not os.path.isdir(path):
-            print(f"Error: expected a directory, got: {path}")
-            print("Usage: pyrex serve app/")
-            sys.exit(1)
-        port = int(args[2]) if len(args) > 2 else 3000
-        serve(path, port=port)
+        serve(directory, port=port)
 
     else:
         print(f"Unknown command: '{command}'")

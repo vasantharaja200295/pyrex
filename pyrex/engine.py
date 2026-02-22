@@ -136,17 +136,17 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
         start = time.monotonic()
         try:
             html = build_route(filepath, layout_path)
-            route_cache[route]["html"] = html
-            route_cache[route]["mtime"] = os.path.getmtime(filepath)
-            ms = int((time.monotonic() - start) * 1000)
-            print(f"  ✓ {route}  built in {ms}ms")
-            return True
         except Exception as e:
             route_cache[route]["html"] = (
                 f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"
             )
-            print(f"  ✗ {route}  build error: {e}")
+            print(f"  [err] {route}: {e}")
             return False
+        route_cache[route]["html"] = html
+        route_cache[route]["mtime"] = os.path.getmtime(filepath)
+        ms = int((time.monotonic() - start) * 1000)
+        print(f"  [ok]  {route}  ({ms}ms)")
+        return True
 
     def _broadcast_reload():
         with _sse_lock:
@@ -157,7 +157,7 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
             except Exception:
                 pass
         if clients:
-            print("  ✓ Browser reloaded")
+            print("  browser reloaded")
 
     # Initial build — all routes
     for route in routes:
@@ -265,12 +265,12 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
     server = _Server(("", port), Handler)
 
     route_list = "  ".join(routes.keys())
-    print(f"\n  🔥 Pyrex dev server")
-    print(f"  → http://localhost:{port}")
-    print(f"  → Routes: {route_list}")
+    print(f"\n  Pyrex dev server")
+    print(f"  http://localhost:{port}")
+    print(f"  routes: {route_list}")
     if layout_path:
-        print(f"  → Layout: {layout_path}")
-    print(f"  → Press Ctrl+C to stop\n")
+        print(f"  layout: layout.pyx")
+    print(f"  Ctrl+C to stop\n")
 
     try:
         server.serve_forever()
