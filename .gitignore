@@ -1,1 +1,13 @@
 .venv
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build output
+*.egg-info/
+
+# Transpiler output
+app/*.html
+*.html
