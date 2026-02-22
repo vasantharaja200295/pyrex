@@ -50,6 +50,14 @@ def App():
         '</div>'
         if is_demo else ""
     )
+    # Conditional that returns an HTML element — must be a Python string, not raw markup.
+    # Wrong:  {<p style="...">text</p> if flag else ""}   ← not valid Python
+    # Right:  assign to local var, use single quotes inside to avoid quote conflicts
+    mode_badge = (
+        '<p style="font-size:1rem;color:#2563eb;font-weight:600;margin:0;">Demo mode active</p>'
+        if is_demo else
+        '<p style="font-size:1rem;color:#6b7280;margin:0;">Production mode</p>'
+    )
 
     return """
     <div style="max-width:740px;margin:2rem auto;padding:0 1rem;">
@@ -108,8 +116,8 @@ def App():
         <section style="margin-bottom:2rem;">
             <h2 style="font-size:1rem;font-weight:700;color:#475569;margin:0 0 .5rem;">6 — Conditional rendering</h2>
             <div style="background:white;border-radius:8px;padding:1rem 1.5rem;box-shadow:0 1px 4px rgba(0,0,0,.08);">
-                <p style="margin:0 0 .5rem;font-size:.85rem;color:#64748b;">Inline ternary text: is_demo = {is_demo} →</p>
-                <strong>{"Demo mode active" if is_demo else "Production mode"}</strong>
+                <p style="margin:0 0 .5rem;font-size:.85rem;color:#64748b;">is_demo = {is_demo} — conditional HTML via local var:</p>
+                {mode_badge}
             </div>
         </section>
 
