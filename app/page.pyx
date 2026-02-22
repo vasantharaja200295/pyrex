@@ -43,7 +43,7 @@ def App():
     pills_html = "".join(pill(t, "#e0e7ff", "#4338ca") for t in tags)
 
     # ── 6. Conditional rendering (Python ternary → HTML block) ───────────────
-    is_demo   = True
+    is_demo   = False
     demo_note = (
         '<div style="background:#fef9c3;color:#854d0e;padding:.6rem 1rem;border-radius:6px;font-size:.875rem;margin-bottom:1.5rem;">'
         'Demo mode — all content below is static HTML baked at transpile time.'
