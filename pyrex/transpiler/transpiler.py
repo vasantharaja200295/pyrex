@@ -13,7 +13,7 @@ Pipeline:
 
 import re
 import json
-from pyrex.parser.pyx_parser import PyxModule, ComponentDef, UseStateCall, UseEffectCall
+from pyrex.parser.pyx_parser import PyxModule, ComponentDef, UseStateCall, UseEffectCall, LocalFunc
 from pyrex.parser.jsx_parser import parse_jsx, JSXNode, TextNode
 
 
@@ -50,14 +50,29 @@ class Transpiler:
         for prop_name, prop_val in props.items():
             jsx = jsx.replace(f"{{{prop_name}}}", str(prop_val))
 
-        # Build server-side scope: props + evaluated local variables
+        # Build server-side scope: props + inner functions + evaluated local variables
         state_names = {s.var_name for s in component.use_states}
         local_scope: dict = dict(props)
+
+        def _globs():
+            # Generator expressions / comprehensions inside eval() look up names in
+            # the *globals* dict, not locals.  Merging local_scope in ensures that
+            # functions defined via exec() and variables already evaluated are visible
+            # to generators, list comps, and other nested scopes.
+            return {"__builtins__": __builtins__, **local_scope}
+
+        # Exec inner function defs first so local vars (and inline exprs) can call them
+        for lf in component.local_funcs:
+            try:
+                exec(compile(lf.source, "<pyrex>", "exec"), _globs(), local_scope)
+            except Exception:
+                pass
+
         for lv in component.local_vars:
             try:
                 local_scope[lv.name] = eval(
                     compile(lv.expr_source, "<pyrex>", "eval"),
-                    {"__builtins__": __builtins__},
+                    _globs(),
                     local_scope,
                 )
             except Exception:
@@ -99,10 +114,15 @@ class Transpiler:
                     try:
                         result = eval(
                             compile(node.content, "<pyrex>", "eval"),
-                            {"__builtins__": __builtins__},
+                            {"__builtins__": __builtins__, **scope},
                             scope,
                         )
-                        return _escape_html(str(result))
+                        result_str = str(result)
+                        # If the result is already markup, inject raw (list rendering,
+                        # conditional HTML blocks, helper functions that return tags).
+                        if result_str.lstrip().startswith("<"):
+                            return result_str
+                        return _escape_html(result_str)
                     except Exception:
                         pass
                 return f'<span data-expr="{node.content}"></span>'

@@ -36,6 +36,12 @@ class LocalVar:
 
 
 @dataclass
+class LocalFunc:
+    name: str    # "format_price"
+    source: str  # full function source via ast.unparse, ready for exec()
+
+
+@dataclass
 class ComponentDef:
     name: str
     params: list[str]           # prop names
@@ -43,6 +49,7 @@ class ComponentDef:
     use_states: list[UseStateCall] = field(default_factory=list)
     use_effects: list[UseEffectCall] = field(default_factory=list)
     local_vars: list[LocalVar] = field(default_factory=list)
+    local_funcs: list[LocalFunc] = field(default_factory=list)
     is_server: bool = False     # decorated with @server_component
     is_root: bool = False       # this is the page root
 
@@ -124,6 +131,9 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
         # Extract local variable assignments (server-side, evaluated at transpile time)
         local_vars = _extract_local_vars(node)
 
+        # Extract inner function definitions (added to eval scope at transpile time)
+        local_funcs = _extract_local_funcs(node)
+
         comp = ComponentDef(
             name=name,
             params=params,
@@ -131,6 +141,7 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
             use_states=use_states,
             use_effects=use_effects,
             local_vars=local_vars,
+            local_funcs=local_funcs,
             is_server=is_server,
             is_root=is_root,
         )
@@ -272,6 +283,27 @@ def _extract_local_vars(func_node: ast.FunctionDef) -> list[LocalVar]:
                 continue
         result.append(LocalVar(name=name, expr_source=ast.unparse(stmt.value)))
 
+    return result
+
+
+def _extract_local_funcs(func_node: ast.FunctionDef) -> list[LocalFunc]:
+    """
+    Collect inner function definitions from the component body.
+
+    Only top-level defs are captured (e.g. `def row(item): ...`).
+    These are exec()'d into the eval scope before local vars are evaluated,
+    so local vars and inline JSX expressions can call them freely.
+
+    PascalCase names are skipped (those are component references, not helpers).
+    """
+    result = []
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        name = stmt.name
+        if name[0].isupper() or name.startswith("_"):
+            continue
+        result.append(LocalFunc(name=name, source=ast.unparse(stmt)))
     return result
 
 

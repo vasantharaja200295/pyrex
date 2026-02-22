@@ -82,7 +82,7 @@ def _parse_element(src: str, pos: int) -> tuple[JSXNode | TextNode, int]:
         if src[pos:pos+2] == '</':
             close_start = pos + 2
             close_tag, pos = _parse_identifier(src, close_start)
-            # support shorthand </> 
+            # support shorthand </>
             if close_tag == '':
                 close_tag = tag
             pos = _skip_whitespace(src, pos)
@@ -90,6 +90,12 @@ def _parse_element(src: str, pos: int) -> tuple[JSXNode | TextNode, int]:
                 raise SyntaxError(f"Expected '>' to close </{close_tag}>")
             pos += 1
             break
+
+        # Skip HTML comments <!-- ... -->
+        if src[pos:pos+4] == '<!--':
+            end = src.find('-->', pos + 4)
+            pos = (end + 3) if end != -1 else len(src)
+            continue
 
         # Text / expression between tags
         if src[pos] != '<':
