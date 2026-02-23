@@ -30,3 +30,23 @@ def use_state(initial=None):
 def use_effect(fn, deps=None):  # noqa: ARG001
     """Register a side-effect that runs when deps change (transpiled to JS)."""
     _ = fn, deps
+
+
+def server_action(fn):
+    """
+    Mark a function as a server action.
+
+    The function runs on the Python server when called from the browser.
+    It receives JSON-decoded keyword arguments from the client and must
+    return an HTML string that replaces the target element's innerHTML.
+
+    Example:
+        @server_action
+        def search(query: str):
+            results = db.search(query)
+            return "".join(f"<li>{r.title}</li>" for r in results)
+
+    Called from JSX event handlers via:
+        onclick="pyrex_action('search', {query: this.value}, '#results')"
+    """
+    return fn

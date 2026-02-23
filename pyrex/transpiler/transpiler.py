@@ -271,6 +271,29 @@ const __Pyrex = {
 };
 
 document.addEventListener('DOMContentLoaded', () => __Pyrex.init());
+
+// ── Server Actions ──────────────────────────────────────────────────────────
+// pyrex_action(name, data, target)
+//   name   — @server_action function name
+//   data   — plain object sent as JSON in the POST body (default: {})
+//   target — CSS selector string or DOM element whose innerHTML is replaced
+window.pyrex_action = async function(name, data, target) {
+  try {
+    const resp = await fetch('/__pyrex_action/' + name, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data || {})
+    });
+    const html = await resp.text();
+    const el = (typeof target === 'string')
+      ? document.querySelector(target)
+      : target;
+    if (el) el.innerHTML = html;
+    else console.warn('pyrex_action: target not found:', target);
+  } catch (e) {
+    console.error('pyrex_action error:', e);
+  }
+};
 // ───────────────────────────────────────────────────────────────────────────
 </script>"""
 

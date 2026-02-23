@@ -66,6 +66,7 @@ class PyxModule:
     components: list[ComponentDef] = field(default_factory=list)
     server_actions: list[ServerAction] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    module_vars: list[str] = field(default_factory=list)  # top-level assignments (e.g. _todos = [])
     root_component: str = ""    # the component to render as the page
 
 
@@ -77,12 +78,24 @@ def parse_pyx_file(filepath: str) -> PyxModule:
 
 def parse_pyx_source(source: str) -> PyxModule:
     module = PyxModule()
-    
+
     # Pre-process: extract JSX triple-quoted strings before ast.parse
     cleaned_source, jsx_store = preprocess(source)
-    
+
+    tree = ast.parse(cleaned_source)
+
     components = _extract_components(cleaned_source, jsx_store)
     module.components = components
+
+    # Module-level imports — needed to reconstruct the exec context for server actions
+    module.imports = _extract_module_imports(tree)
+
+    # Module-level variable assignments (e.g. _todos = [], DB_PATH = "...") —
+    # exec'd into the action namespace so actions can reference them
+    module.module_vars = _extract_module_vars(tree)
+
+    # @server_action decorated top-level functions
+    module.server_actions = _extract_server_actions(tree)
 
     # The root is either decorated @page or the last component defined
     for comp in components:
@@ -103,6 +116,7 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
     """
     tree = ast.parse(source)
     components = []
+
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -308,6 +322,57 @@ def _extract_local_funcs(func_node: ast.FunctionDef) -> list[LocalFunc]:
             continue
         result.append(LocalFunc(name=name, source=ast.unparse(stmt)))
     return result
+
+
+def _extract_module_vars(tree: ast.Module) -> list[str]:
+    """
+    Return top-level variable assignments as source strings.
+
+    Captures plain assignments (`x = []`) and annotated assignments
+    (`x: list[str] = []`) so server actions can reference module-level
+    state stores, constants, and config variables.
+
+    Function defs, class defs, and imports are excluded — they are handled
+    separately or are not relevant to the action exec context.
+    """
+    result = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            result.append(ast.unparse(node))
+    return result
+
+
+def _extract_module_imports(tree: ast.Module) -> list[str]:
+    """
+    Return all top-level import statements as source strings.
+
+    These are exec()'d into the server action namespace so actions can
+    use the same libraries the .pyx file imports (sqlite3, os, etc.).
+    """
+    return [
+        ast.unparse(node)
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+
+
+def _extract_server_actions(tree: ast.Module) -> list[ServerAction]:
+    """
+    Return all top-level @server_action decorated functions.
+
+    Only top-level functions are considered — nested definitions are ignored.
+    The full function source (including decorator) is stored so it can be
+    exec()'d verbatim in the server's action namespace.
+    """
+    actions = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        decorators = [_get_decorator_name(d) for d in node.decorator_list]
+        if "server_action" not in decorators:
+            continue
+        actions.append(ServerAction(name=node.name, body=ast.unparse(node)))
+    return actions
 
 
 def _get_decorator_name(decorator) -> str:

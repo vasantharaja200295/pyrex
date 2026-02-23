@@ -8,6 +8,7 @@ Entry points:
 - serve(directory)     → starts a multi-route dev HTTP server
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -121,6 +122,62 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
     route_cache: dict[str, dict] = {route: {"html": "", "mtime": 0.0} for route in routes}
     layout_mtime: dict[str, float] = {"v": 0.0}
 
+    # Server action registry: action_name → Python callable
+    # Each registered action lives in a per-file persistent namespace so that
+    # module-level variables (e.g. in-memory stores) survive across requests.
+    _action_registry: dict[str, callable] = {}
+    _action_namespaces: dict[str, dict] = {}   # filepath → exec namespace
+
+    def _register_actions(filepath: str) -> None:
+        """Parse filepath and exec all @server_action functions into the registry."""
+        try:
+            module = parse_pyx_file(filepath)
+        except Exception:
+            return
+        if not module.server_actions:
+            return
+
+        # Reuse existing namespace so in-memory state survives hot-reloads of
+        # OTHER files; reset it only when THIS file changes (new code = fresh state).
+        ns = _action_namespaces.get(filepath)
+        if ns is None:
+            ns = {"__builtins__": __builtins__}
+            _action_namespaces[filepath] = ns
+
+        # Exec module imports (skip pyrex itself — stubs already available via __init__)
+        from pyrex import page, component, layout, use_state, use_effect, server_action
+        ns.update({
+            "page": page, "component": component, "layout": layout,
+            "use_state": use_state, "use_effect": use_effect,
+            "server_action": server_action,
+        })
+        for imp_src in module.imports:
+            if "pyrex" in imp_src:
+                continue
+            try:
+                exec(compile(imp_src, filepath, "exec"), ns)
+            except Exception:
+                pass
+
+        # Exec module-level variable assignments so actions can reference them
+        # (e.g. _todos: list[str] = [], DB_PATH = "app.db")
+        for var_src in module.module_vars:
+            try:
+                exec(compile(var_src, filepath, "exec"), ns)
+            except Exception:
+                pass
+
+        # Exec each action function
+        for action in module.server_actions:
+            try:
+                exec(compile(action.body, filepath, "exec"), ns)
+                fn = ns.get(action.name)
+                if callable(fn):
+                    _action_registry[action.name] = fn
+                    print(f"  [action] {action.name}")
+            except Exception as e:
+                print(f"  [warn]   could not register action {action.name!r}: {e}")
+
     # SSE client registry — one Queue per open browser tab
     _sse_clients: list[queue.Queue] = []
     _sse_lock = threading.Lock()
@@ -144,6 +201,10 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
             return False
         route_cache[route]["html"] = html
         route_cache[route]["mtime"] = os.path.getmtime(filepath)
+        # Reset this file's action namespace so changed code takes effect,
+        # then re-register its server actions.
+        _action_namespaces.pop(filepath, None)
+        _register_actions(filepath)
         ms = int((time.monotonic() - start) * 1000)
         print(f"  [ok]  {route}  ({ms}ms)")
         return True
@@ -213,6 +274,50 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        def do_POST(self):
+            if not self.path.startswith("/__pyrex_action/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            action_name = self.path[len("/__pyrex_action/"):]
+            # Strip query string if present
+            if "?" in action_name:
+                action_name = action_name[:action_name.index("?")]
+
+            # Parse JSON body
+            content_length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                kwargs = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                kwargs = {}
+
+            fn = _action_registry.get(action_name)
+            if fn is None:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"No server action registered: {action_name!r}".encode())
+                return
+
+            try:
+                result = fn(**kwargs)
+                html = str(result) if result is not None else ""
+            except Exception as e:
+                html = (
+                    f'<div style="color:red;padding:.5rem 1rem;font-family:monospace;'
+                    f'border:1px solid #fca5a5;border-radius:4px;background:#fef2f2;">'
+                    f'<strong>Action error</strong> in <code>{action_name}()</code>: {e}</div>'
+                )
+
+            data = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
         def log_message(self, format, *args):
             pass  # suppress default request logging
