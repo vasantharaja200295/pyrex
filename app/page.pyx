@@ -69,6 +69,9 @@ def App():
 
         {demo_note}
 
+        <div>
+        <h1>{1+5}</h1></div>
+
         <!-- ── Section 1: local vars + method calls ── -->
         <section style="margin-bottom:2rem;">
             <h2 style="font-size:1rem;font-weight:700;color:#475569;margin:0 0 .5rem;">1 — Local vars + method calls</h2>

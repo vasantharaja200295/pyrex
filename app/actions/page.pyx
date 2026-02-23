@@ -121,7 +121,7 @@ def App():
                 <input id="todo-input"
                     placeholder="New todo..."
                     style="flex:1;padding:.5rem .75rem;border:1px solid #e2e8f0;border-radius:6px;font-size:.9rem;"
-                    onkeydown="if(event.key==='Enter') pyrex_action('add_todo', {text: this.value}, '#todo-list'); this.value='';" />
+                    onkeydown="if(event.key==='Enter') {pyrex_action('add_todo', {text: this.value}, '#todo-list'); this.value='';}" />
                 <button
                     onclick="pyrex_action('add_todo', {text: document.getElementById('todo-input').value}, '#todo-list'); document.getElementById('todo-input').value='';"
                     style="padding:.5rem 1.25rem;background:#6366f1;color:white;border:none;border-radius:6px;font-size:.9rem;font-weight:600;cursor:pointer;">
