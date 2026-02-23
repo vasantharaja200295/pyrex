@@ -13,7 +13,7 @@ Pipeline:
 
 import re
 import json
-from pyrex.parser.pyx_parser import PyxModule, ComponentDef, UseStateCall, UseEffectCall
+from pyrex.parser.pyx_parser import PyxModule, ComponentDef, UseStateCall, UseEffectCall, LocalFunc
 from pyrex.parser.jsx_parser import parse_jsx, JSXNode, TextNode
 
 
@@ -50,6 +50,42 @@ class Transpiler:
         for prop_name, prop_val in props.items():
             jsx = jsx.replace(f"{{{prop_name}}}", str(prop_val))
 
+        # Build server-side scope: props + inner functions + evaluated local variables
+        state_names = {s.var_name for s in component.use_states}
+        local_scope: dict = dict(props)
+
+        def _globs():
+            # Generator expressions / comprehensions inside eval() look up names in
+            # the *globals* dict, not locals.  Merging local_scope in ensures that
+            # functions defined via exec() and variables already evaluated are visible
+            # to generators, list comps, and other nested scopes.
+            return {"__builtins__": __builtins__, **local_scope}
+
+        # Exec inner function defs first so local vars (and inline exprs) can call them
+        for lf in component.local_funcs:
+            try:
+                exec(compile(lf.source, "<pyrex>", "exec"), _globs(), local_scope)
+            except Exception:
+                pass
+
+        for lv in component.local_vars:
+            try:
+                local_scope[lv.name] = eval(
+                    compile(lv.expr_source, "<pyrex>", "eval"),
+                    _globs(),
+                    local_scope,
+                )
+            except Exception:
+                pass  # falls back to <span data-expr> at render time
+
+        # Substitute simple {var_name} references that are not state vars
+        for var_name, val in local_scope.items():
+            if var_name not in state_names:
+                jsx = jsx.replace(f"{{{var_name}}}", str(val))
+
+        # Store scope so _node_to_html can eval complex expressions like {x.upper()}
+        self._render_scope = local_scope
+
         # For state variables, inject placeholder spans that JS will hydrate
         for state in component.use_states:
             initial = _py_value_to_js_literal(state.initial_value)
@@ -72,7 +108,23 @@ class Transpiler:
     def _node_to_html(self, node, component: ComponentDef) -> str:
         if isinstance(node, TextNode):
             if node.is_expression:
-                # Unresolved expression at render time — leave as comment for now
+                # Try to evaluate against the server-side scope (handles {x.upper()} etc.)
+                scope = getattr(self, "_render_scope", None)
+                if scope is not None:
+                    try:
+                        result = eval(
+                            compile(node.content, "<pyrex>", "eval"),
+                            {"__builtins__": __builtins__, **scope},
+                            scope,
+                        )
+                        result_str = str(result)
+                        # If the result is already markup, inject raw (list rendering,
+                        # conditional HTML blocks, helper functions that return tags).
+                        if result_str.lstrip().startswith("<"):
+                            return result_str
+                        return _escape_html(result_str)
+                    except Exception:
+                        pass
                 return f'<span data-expr="{node.content}"></span>'
             return _escape_html(node.content)
 
@@ -135,6 +187,20 @@ class Transpiler:
                     parts.append(key)
             elif isinstance(val, str) and val.startswith('_expr_:'):
                 expr = val[7:]
+                # Try to resolve as a server-side expression first
+                scope = getattr(self, "_render_scope", None)
+                if scope is not None:
+                    try:
+                        result = eval(
+                            compile(expr, "<pyrex>", "eval"),
+                            {"__builtins__": __builtins__},
+                            scope,
+                        )
+                        parts.append(f'{key}="{_escape_html(str(result))}"')
+                        continue
+                    except Exception:
+                        pass
+                # Fall back to JS expression translation
                 js_val = _py_expr_to_js(expr, component)
                 parts.append(f'{key}="{js_val}"')
             else:

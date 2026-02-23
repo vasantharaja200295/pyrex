@@ -30,12 +30,26 @@ class UseEffectCall:
 
 
 @dataclass
+class LocalVar:
+    name: str         # "greeting"
+    expr_source: str  # Python source of the RHS, e.g. 'f"Hello, {name}"'
+
+
+@dataclass
+class LocalFunc:
+    name: str    # "format_price"
+    source: str  # full function source via ast.unparse, ready for exec()
+
+
+@dataclass
 class ComponentDef:
     name: str
     params: list[str]           # prop names
     jsx_string: str             # raw JSX string returned
     use_states: list[UseStateCall] = field(default_factory=list)
     use_effects: list[UseEffectCall] = field(default_factory=list)
+    local_vars: list[LocalVar] = field(default_factory=list)
+    local_funcs: list[LocalFunc] = field(default_factory=list)
     is_server: bool = False     # decorated with @server_component
     is_root: bool = False       # this is the page root
     is_layout: bool = False     # decorated with @layout
@@ -113,8 +127,14 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
         # Extract use_state calls
         use_states = _extract_use_states(node, source)
 
-        # Extract use_effect calls  
+        # Extract use_effect calls
         use_effects = _extract_use_effects(node, source)
+
+        # Extract local variable assignments (server-side, evaluated at transpile time)
+        local_vars = _extract_local_vars(node)
+
+        # Extract inner function definitions (added to eval scope at transpile time)
+        local_funcs = _extract_local_funcs(node)
 
         comp = ComponentDef(
             name=name,
@@ -122,6 +142,8 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
             jsx_string=jsx_string,
             use_states=use_states,
             use_effects=use_effects,
+            local_vars=local_vars,
+            local_funcs=local_funcs,
             is_server=is_server,
             is_root=is_root,
             is_layout=is_layout,
@@ -230,6 +252,62 @@ def _extract_use_effects(func_node: ast.FunctionDef, source: str) -> list[UseEff
         ))
 
     return effects
+
+
+def _extract_local_vars(func_node: ast.FunctionDef) -> list[LocalVar]:
+    """
+    Collect simple top-level name = expr assignments that are NOT use_state /
+    use_effect calls.  These are evaluated at transpile time and their values
+    stamped as static strings in the HTML.
+
+    Only top-level body statements are inspected (not nested ifs, loops, etc.)
+    so the set of captured vars is predictable and deterministic.
+    """
+    skip_calls = {"use_state", "use_effect"}
+    result = []
+
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        # Only single-target assignments (skip tuple unpacking like a, b = ...)
+        if len(stmt.targets) != 1:
+            continue
+        target = stmt.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        name = target.id
+        # Skip PascalCase (component references) and private/dunder names
+        if name[0].isupper() or name.startswith("_"):
+            continue
+        # Skip use_state / use_effect calls — handled separately
+        if isinstance(stmt.value, ast.Call):
+            fn = stmt.value.func
+            if isinstance(fn, ast.Name) and fn.id in skip_calls:
+                continue
+        result.append(LocalVar(name=name, expr_source=ast.unparse(stmt.value)))
+
+    return result
+
+
+def _extract_local_funcs(func_node: ast.FunctionDef) -> list[LocalFunc]:
+    """
+    Collect inner function definitions from the component body.
+
+    Only top-level defs are captured (e.g. `def row(item): ...`).
+    These are exec()'d into the eval scope before local vars are evaluated,
+    so local vars and inline JSX expressions can call them freely.
+
+    PascalCase names are skipped (those are component references, not helpers).
+    """
+    result = []
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.FunctionDef):
+            continue
+        name = stmt.name
+        if name[0].isupper() or name.startswith("_"):
+            continue
+        result.append(LocalFunc(name=name, source=ast.unparse(stmt)))
+    return result
 
 
 def _get_decorator_name(decorator) -> str:
