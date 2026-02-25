@@ -73,7 +73,7 @@ def _status_badge(status: int) -> Text:
 def print_boot_sequence(version: str = "0.1.0"):
     console.print()
     title = Text()
-    title.append("◈ PYREX ", style=f"bold {C_BRAND}")
+    title.append("PYREX ", style=f"bold {C_BRAND}")
     title.append(f"v{version}", style=C_MUTED)
     console.print(title)
     console.print()
