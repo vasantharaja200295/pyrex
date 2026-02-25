@@ -19,10 +19,11 @@ from pyrex.parser.jsx_parser import parse_jsx, JSXNode, TextNode
 
 
 class Transpiler:
-    def __init__(self, module: PyxModule):
+    def __init__(self, module: PyxModule, action_ids: dict[str, str] | None = None):
         self.module = module
         self.component_map = {c.name: c for c in module.components}
         self._id_counter = 0
+        self._action_ids = action_ids or {}
 
     def transpile(self) -> str:
         """Entry point — returns complete HTML page as string."""
@@ -287,8 +288,9 @@ document.addEventListener('DOMContentLoaded', () => __Pyrex.init());
         """
         Generate one named async JS function per @server_action.
 
-        Each proxy calls POST /__pyrex/actions/<name> with the action's
-        parameters as a JSON body and returns the parsed JSON response.
+        Each proxy calls POST /__pyrex/ with {"i": action_id, "a": params}
+        and returns the parsed JSON response. The action ID is the function
+        name in dev mode or a sha256 hash in production mode.
         Developers call these functions directly from event handlers:
 
             onclick="add_todo(input_val).then(d => set_count(d.count))"
@@ -297,17 +299,21 @@ document.addEventListener('DOMContentLoaded', () => __Pyrex.init());
             return ""
         fns = []
         for action in self.module.server_actions:
+            action_id = self._action_ids.get(action.name, action.name)
             param_list = ", ".join(p[0] for p in action.params)
-            json_obj = (
+            args_obj = (
                 "{ " + ", ".join(p[0] for p in action.params) + " }"
                 if action.params else "{}"
             )
             fns.append(f"""
 async function {action.name}({param_list}) {{
-    const res = await fetch('/__pyrex/actions/{action.name}', {{
+    const res = await fetch('/__pyrex/', {{
         method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({json_obj}),
+        headers: {{
+            'Content-Type': 'application/json',
+            'X-Pyrex-Token': window.__PYREX_TOKEN || '',
+        }},
+        body: JSON.stringify({{ i: {json.dumps(action_id)}, a: {args_obj} }}),
     }});
     return await res.json();
 }}""")

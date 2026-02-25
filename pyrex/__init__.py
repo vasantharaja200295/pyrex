@@ -37,7 +37,7 @@ def server_action(fn):
     """
     Mark an async function as a Pyrex server action.
 
-    The function is registered as a POST /__pyrex/actions/<name> endpoint.
+    The function is dispatched through the single POST /__pyrex/ endpoint.
     It receives JSON-decoded keyword arguments from the client and must return
     a JSON-serializable value (dict, list, str, int, float, bool, or None).
 
@@ -93,7 +93,8 @@ class Pyrex:
         self._shutdown.append(fn)
         return fn
 
-    def run(self, directory: str = "app", port: int = 3000, watch: bool = True):
+    def run(self, directory: str = "app", port: int = 3000, watch: bool = True,
+            debug: bool = True, secret_key: str = ""):
         """Start the Pyrex dev server."""
         from pyrex.engine import serve
         serve(
@@ -102,4 +103,6 @@ class Pyrex:
             watch=watch,
             startup_hooks=self._startup,
             shutdown_hooks=self._shutdown,
+            debug=debug,
+            secret_key=secret_key,
         )
