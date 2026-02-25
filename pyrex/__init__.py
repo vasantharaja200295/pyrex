@@ -94,7 +94,7 @@ class Pyrex:
         return fn
 
     def run(self, directory: str = "app", port: int = 3000, watch: bool = True,
-            debug: bool = True, secret_key: str = ""):
+            mode: str = "development", secret_key: str = ""):
         """Start the Pyrex dev server."""
         from pyrex.engine import serve
         serve(
@@ -103,6 +103,6 @@ class Pyrex:
             watch=watch,
             startup_hooks=self._startup,
             shutdown_hooks=self._shutdown,
-            debug=debug,
+            mode=mode,
             secret_key=secret_key,
         )

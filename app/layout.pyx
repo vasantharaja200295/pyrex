@@ -4,7 +4,7 @@ from pyrex import layout, component
 def Header():
     return """
     <header style="background:#0f172a;color:white;padding:1rem 2rem;display:flex;align-items:center;gap:1rem;">
-        <span style="font-size:1.5rem;font-weight:700;">🔥 Pyrex Bling Bling ding ling</span>
+        <span style="font-size:1.5rem;font-weight:700;">🔥 Pyrex</span>
         <span style="color:#94a3b8;font-size:0.9rem;">Python → HTML Framework POC Test Dummy</span>
         <a href='/' style="color:#94a3b8;font-size:0.9rem;">Home</a>
         <a href='/about' style="color:#94a3b8;font-size:0.9rem;">About</a>

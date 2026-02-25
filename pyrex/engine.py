@@ -21,6 +21,11 @@ from pathlib import Path
 from pyrex.parser.pyx_parser import parse_pyx_file, parse_pyx_source
 from pyrex.transpiler.transpiler import Transpiler
 
+try:
+    from pyrex import tui as _tui
+except Exception:
+    _tui = None
+
 
 # ── Action ID helper ─────────────────────────────────────────────────────────
 
@@ -141,7 +146,11 @@ def _find_layout(app_dir: str) -> str | None:
 
 def serve(directory: str = "app", port: int = 3000, watch: bool = True,
           startup_hooks=(), shutdown_hooks=(),
-          debug: bool = True, secret_key: str = ""):
+          mode: str = "development",
+          secret_key: str = "",
+          on_ready=None,
+          force_rebuild=None,
+          env_files=None):
     """
     Start a dev server that serves all page.pyx files found under `directory`.
 
@@ -149,25 +158,24 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                     directory/about/page.pyx     → /about
                     directory/blog/post/page.pyx → /blog/post
 
-    An optional directory/layout.pyx (must contain a @layout component) wraps
-    every page. Changing layout.pyx triggers a rebuild of all routes.
+    mode="development" (default): debug-friendly — plain action IDs, full error
+                                   details, no CSRF/origin enforcement.
+    mode="production":             sha256 action IDs, CSRF token + Origin header
+                                   validation, opaque error responses.
 
-    All server actions are dispatched through a single POST /__pyrex/ endpoint.
-    Named JS proxy functions are auto-generated in each served page.
+    on_ready is an optional callable invoked after the initial build is complete
+    and just before uvicorn starts. Use it to print the "ready" banner and start
+    key-binding listeners from the CLI layer.
 
-    debug=True  (default): action IDs are plain function names; CSRF/origin
-                           checks are skipped; full error details returned.
-    debug=False (production): action IDs are sha256 hashes; CSRF token and
-                              Origin header are validated; errors are opaque.
-    secret_key is used for hashing action IDs in production. Falls back to the
-    PYREX_SECRET_KEY environment variable when not supplied.
-
-    Each browser tab connects to /__pyrex_ws (WebSocket) and receives a "reload"
-    message on any rebuild, triggering an automatic page reload.
+    force_rebuild is an optional threading.Event; when set by the caller (e.g.
+    the 'r' key handler) the watcher triggers a full rebuild on the next tick.
     """
     from fastapi import FastAPI, Request, WebSocket
     from fastapi.responses import HTMLResponse, JSONResponse
+    from starlette.middleware.base import BaseHTTPMiddleware
     import uvicorn
+
+    debug = (mode == "development")
 
     # Resolve secret_key from env if not provided explicitly
     if not secret_key:
@@ -243,9 +251,11 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                     action_id = _make_action_id(action.name, secret_key, debug)
                     _action_registry[action_id] = fn
                     _id_to_name[action_id] = action.name
-                    print(f"  [action] {action.name}")
             except Exception as e:
-                print(f"  [warn]   could not register action {action.name!r}: {e}")
+                if _tui:
+                    _tui.print_error(f"Could not register action {action.name!r}: {e}")
+                else:
+                    print(f"  [warn]   could not register action {action.name!r}: {e}")
 
     # WebSocket queues — one asyncio.Queue per connected browser tab.
     # The watcher thread pushes "reload" into each queue via loop.call_soon_threadsafe.
@@ -292,7 +302,10 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             route_cache[route]["html"] = (
                 f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"
             )
-            print(f"  [err] {route}: {e}")
+            if _tui:
+                _tui.print_error(f"Build error in {route}: {e}")
+            else:
+                print(f"  [err] {route}: {e}")
             return False
         route_cache[route]["html"] = html
         route_cache[route]["mtime"] = os.path.getmtime(filepath)
@@ -300,8 +313,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
         # then re-register its server actions.
         _action_namespaces.pop(filepath, None)
         _register_actions(filepath)
-        ms = int((time.monotonic() - start) * 1000)
-        print(f"  [ok]  {route}  ({ms}ms)")
         return True
 
     def _signal_reload():
@@ -315,8 +326,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                 loop.call_soon_threadsafe(q.put_nowait, "reload")
             except Exception:
                 pass
-        if queues:
-            print("  browser reload signalled")
 
     # Initial build — all routes
     for route in routes:
@@ -336,6 +345,23 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     _TOKEN_SCRIPT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
 
     app = FastAPI()
+
+    # Request logging middleware — skips internal /__pyrex* endpoints
+    if _tui:
+        class _LogMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                start = time.monotonic()
+                response = await call_next(request)
+                if not request.url.path.startswith("/__pyrex"):
+                    _tui.print_request(
+                        request.method,
+                        request.url.path,
+                        response.status_code,
+                        (time.monotonic() - start) * 1000,
+                    )
+                return response
+
+        app.add_middleware(_LogMiddleware)
 
     @app.on_event("startup")
     async def _capture_loop():
@@ -450,17 +476,26 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             kwargs = {k: v for k, v in args.items() if k in sig.parameters}
 
         # 6. Call the action function
+        _t0 = time.monotonic()
         try:
             if inspect.iscoroutinefunction(fn):
                 result = await fn(**kwargs)
             else:
                 result = fn(**kwargs)
+            if _tui:
+                _tui.print_action_call(fn_name, (time.monotonic() - _t0) * 1000, ok=True)
             return JSONResponse(result)
         except Exception as exc:
+            dur_ms = (time.monotonic() - _t0) * 1000
+            if _tui:
+                _tui.print_action_call(fn_name, dur_ms, ok=False)
             if debug:
-                import traceback
+                import traceback as _tb
+                tb_str = _tb.format_exc()
+                if _tui:
+                    _tui.print_error(str(exc), tb_str)
                 return JSONResponse(
-                    {"error": str(exc), "traceback": traceback.format_exc()},
+                    {"error": str(exc), "traceback": tb_str},
                     status_code=500,
                 )
             return JSONResponse({"error": "request failed"}, status_code=500)
@@ -472,12 +507,22 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             time.sleep(0.5)
             rebuilt = []
 
+            # Manual reload triggered by 'r' key (force_rebuild event)
+            if force_rebuild and force_rebuild.is_set():
+                force_rebuild.clear()
+                if _tui:
+                    _tui.print_reload_banner()
+                for route in routes:
+                    if _rebuild_route(route):
+                        rebuilt.append(route)
+
             # Check each page file for changes
             for route, filepath in routes.items():
                 try:
                     mtime = os.path.getmtime(filepath)
                     if mtime != route_cache[route]["mtime"]:
-                        print(f"\n  File changed ({route}), rebuilding...")
+                        if _tui:
+                            _tui.print_reload_banner()
                         if _rebuild_route(route):
                             rebuilt.append(route)
                 except FileNotFoundError:
@@ -489,7 +534,8 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                     mtime = os.path.getmtime(layout_path)
                     if mtime != layout_mtime["v"]:
                         layout_mtime["v"] = mtime
-                        print("\n  layout.pyx changed, rebuilding all routes...")
+                        if _tui:
+                            _tui.print_reload_banner()
                         for route in routes:
                             if _rebuild_route(route):
                                 rebuilt.append(route)
@@ -498,6 +544,8 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
             if rebuilt:
                 _signal_reload()
+                if _tui:
+                    _tui.print_reload_done(rebuilt)
 
     if watch:
         t = threading.Thread(target=watcher, daemon=True)
@@ -505,16 +553,17 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # ── Start server ─────────────────────────────────────────────────────────
 
-    route_list = "  ".join(routes.keys())
-    print(f"\n  Pyrex dev server")
-    print(f"  http://localhost:{port}")
-    print(f"  routes: {route_list}")
-    if layout_path:
-        print(f"  layout: layout.pyx")
-    if all_action_names:
-        mode = "dev" if debug else "prod"
-        print(f"  actions: {', '.join(sorted(all_action_names))}  [{mode}] → POST /__pyrex/")
-    print(f"  Ctrl+C to stop\n")
+    if on_ready:
+        on_ready()
+    else:
+        # Fallback when called without a CLI on_ready (e.g. via Pyrex.run())
+        route_list = "  ".join(routes.keys())
+        print(f"\n  Pyrex dev server — {mode}")
+        print(f"  http://localhost:{port}")
+        print(f"  routes: {route_list}")
+        if all_action_names:
+            print(f"  actions: {', '.join(sorted(all_action_names))} → POST /__pyrex/")
+        print(f"  Ctrl+C to stop\n")
 
     try:
         uvicorn.run(
