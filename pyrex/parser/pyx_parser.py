@@ -42,6 +42,12 @@ class LocalFunc:
 
 
 @dataclass
+class LocalAsyncFunc:
+    name: str    # "handle_add"
+    source: str  # full async def source via ast.unparse, ready for transpilation
+
+
+@dataclass
 class ComponentDef:
     name: str
     params: list[str]           # prop names
@@ -50,6 +56,7 @@ class ComponentDef:
     use_effects: list[UseEffectCall] = field(default_factory=list)
     local_vars: list[LocalVar] = field(default_factory=list)
     local_funcs: list[LocalFunc] = field(default_factory=list)
+    local_async_funcs: list = field(default_factory=list)  # list[LocalAsyncFunc]
     is_server: bool = False     # decorated with @server_component
     is_root: bool = False       # this is the page root
     is_layout: bool = False     # decorated with @layout
@@ -58,7 +65,8 @@ class ComponentDef:
 @dataclass
 class ServerAction:
     name: str
-    body: str  # python source — will be registered as an endpoint
+    params: list[tuple[str, str]]  # [(param_name, type_annotation), ...]
+    body: str  # python source — will be exec()'d and registered as an endpoint
 
 
 @dataclass
@@ -150,6 +158,9 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
         # Extract inner function definitions (added to eval scope at transpile time)
         local_funcs = _extract_local_funcs(node)
 
+        # Extract async inner functions (transpiled to client-side JS async functions)
+        local_async_funcs = _extract_local_async_funcs(node)
+
         comp = ComponentDef(
             name=name,
             params=params,
@@ -158,6 +169,7 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
             use_effects=use_effects,
             local_vars=local_vars,
             local_funcs=local_funcs,
+            local_async_funcs=local_async_funcs,
             is_server=is_server,
             is_root=is_root,
             is_layout=is_layout,
@@ -324,6 +336,27 @@ def _extract_local_funcs(func_node: ast.FunctionDef) -> list[LocalFunc]:
     return result
 
 
+def _extract_local_async_funcs(func_node: ast.FunctionDef) -> list[LocalAsyncFunc]:
+    """
+    Collect top-level async function definitions from the component body.
+
+    These become client-side JS async functions — they are NOT exec()'d on the
+    server. Instead, the transpiler converts them to JS `async function` blocks
+    and injects them into the page alongside the __Pyrex runtime.
+
+    PascalCase and _-prefixed names are skipped (same rules as local_funcs).
+    """
+    result = []
+    for stmt in func_node.body:
+        if not isinstance(stmt, ast.AsyncFunctionDef):
+            continue
+        name = stmt.name
+        if name[0].isupper() or name.startswith("_"):
+            continue
+        result.append(LocalAsyncFunc(name=name, source=ast.unparse(stmt)))
+    return result
+
+
 def _extract_module_vars(tree: ast.Module) -> list[str]:
     """
     Return top-level variable assignments as source strings.
@@ -360,18 +393,22 @@ def _extract_server_actions(tree: ast.Module) -> list[ServerAction]:
     """
     Return all top-level @server_action decorated functions.
 
-    Only top-level functions are considered — nested definitions are ignored.
-    The full function source (including decorator) is stored so it can be
-    exec()'d verbatim in the server's action namespace.
+    Accepts both `def` and `async def` — server actions are expected to be
+    async but sync functions are also registered for backwards compatibility.
+    Only top-level functions are considered (not nested definitions).
     """
     actions = []
     for node in tree.body:
-        if not isinstance(node, ast.FunctionDef):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         decorators = [_get_decorator_name(d) for d in node.decorator_list]
         if "server_action" not in decorators:
             continue
-        actions.append(ServerAction(name=node.name, body=ast.unparse(node)))
+        params = [
+            (arg.arg, ast.unparse(arg.annotation) if arg.annotation else "Any")
+            for arg in node.args.args
+        ]
+        actions.append(ServerAction(name=node.name, params=params, body=ast.unparse(node)))
     return actions
 
 

@@ -66,9 +66,18 @@ def main():
             sys.exit(1)
         serve(directory, port=port)
 
+    elif command == "dev":
+        # Run main.py in the current directory (Pyrex bootstrap entry point)
+        if not os.path.exists("main.py"):
+            print("Error: no main.py found in current directory.")
+            print("Create a main.py with: from pyrex import Pyrex; app = Pyrex(); app.run()")
+            sys.exit(1)
+        import subprocess
+        subprocess.run([sys.executable, "main.py"])
+
     else:
         print(f"Unknown command: '{command}'")
-        print("Available commands: build, serve")
+        print("Available commands: build, serve, dev")
         sys.exit(1)
 
 

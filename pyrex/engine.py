@@ -5,15 +5,41 @@ Entry points:
 - build_file(filepath) → HTML string   (single-file build, used by `pyrex build`)
 - build_source(source) → HTML string   (in-memory build, useful for testing)
 - build_route(page_filepath, layout_filepath) → HTML string  (used by serve)
-- serve(directory)     → starts a multi-route dev HTTP server
+- serve(directory)     → starts a multi-route dev HTTP server (FastAPI + uvicorn)
 """
 
+import asyncio
+import inspect
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 from pyrex.parser.pyx_parser import parse_pyx_file, parse_pyx_source
 from pyrex.transpiler.transpiler import Transpiler
+
+
+# ── Type coercion helper (exported for tests) ────────────────────────────────
+
+def _coerce_type(value, type_str: str):
+    """
+    Coerce value to the Python type named by type_str.
+    Raises ValueError or TypeError on failure (caller returns 422).
+    Unknown type annotations are returned as-is.
+    """
+    TYPE_MAP = {
+        "str":   str,
+        "float": float,
+        "int":   int,
+        "bool":  bool,
+        "list":  list,
+        "dict":  dict,
+    }
+    target = TYPE_MAP.get(type_str)
+    if target is None:
+        return value
+    return target(value)
 
 
 # ── Single-file build helpers (unchanged, used by `pyrex build`) ────────────
@@ -60,7 +86,8 @@ def build_route(page_filepath: str, layout_filepath: str | None = None) -> str:
 
     all_js = (pt._build_js_runtime() + "\n"
               + pt._build_all_component_js() + "\n"
-              + lt._build_all_component_js())
+              + lt._build_all_component_js() + "\n"
+              + pt._build_server_action_proxies())
     return pt._wrap_html_page(layout_body, all_js)
 
 
@@ -89,9 +116,10 @@ def _find_layout(app_dir: str) -> str | None:
     return str(p.resolve()) if p.exists() else None
 
 
-# ── Dev server ───────────────────────────────────────────────────────────────
+# ── Dev server (FastAPI + uvicorn) ───────────────────────────────────────────
 
-def serve(directory: str, port: int = 3000, watch: bool = True):
+def serve(directory: str = "app", port: int = 3000, watch: bool = True,
+          startup_hooks=(), shutdown_hooks=()):
     """
     Start a dev server that serves all page.pyx files found under `directory`.
 
@@ -102,13 +130,15 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
     An optional directory/layout.pyx (must contain a @layout component) wraps
     every page. Changing layout.pyx triggers a rebuild of all routes.
 
+    Server actions are registered as POST /__pyrex/actions/<name> endpoints.
+    Named JS proxy functions are auto-generated in each served page.
+
     Each browser tab connected to /__pyrex_reload receives an SSE message on
     any rebuild and reloads automatically.
     """
-    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-    import threading
-    import queue
-    import time
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    import uvicorn
 
     directory = os.path.abspath(directory)
     routes = _discover_routes(directory)
@@ -160,7 +190,6 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
                 pass
 
         # Exec module-level variable assignments so actions can reference them
-        # (e.g. _todos: list[str] = [], DB_PATH = "app.db")
         for var_src in module.module_vars:
             try:
                 exec(compile(var_src, filepath, "exec"), ns)
@@ -178,9 +207,10 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
             except Exception as e:
                 print(f"  [warn]   could not register action {action.name!r}: {e}")
 
-    # SSE client registry — one Queue per open browser tab
-    _sse_clients: list[queue.Queue] = []
+    # SSE state — asyncio.Queue per connected tab; thread→asyncio bridge
+    _sse_queues: list[asyncio.Queue] = []
     _sse_lock = threading.Lock()
+    _loop_ref: dict = {}   # {"v": running asyncio event loop}
 
     # Injected into every served page (dev-only, never written to disk)
     _SSE_SCRIPT = (
@@ -210,14 +240,17 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
         return True
 
     def _broadcast_reload():
+        loop = _loop_ref.get("v")
+        if not loop:
+            return
         with _sse_lock:
-            clients = list(_sse_clients)
-        for q in clients:
+            queues = list(_sse_queues)
+        for q in queues:
             try:
-                q.put("data: reload\n\n")
+                loop.call_soon_threadsafe(q.put_nowait, "data: reload\n\n")
             except Exception:
                 pass
-        if clients:
+        if queues:
             print("  browser reloaded")
 
     # Initial build — all routes
@@ -231,96 +264,125 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
         except FileNotFoundError:
             pass
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path in route_cache:
-                html = route_cache[self.path]["html"].replace(
+    # Collect all action names + param type info from every page file
+    all_action_names: set[str] = set()
+    action_param_types: dict[str, list[tuple[str, str]]] = {}
+    for filepath in routes.values():
+        try:
+            mod = parse_pyx_file(filepath)
+            for a in mod.server_actions:
+                all_action_names.add(a.name)
+                action_param_types[a.name] = a.params
+        except Exception:
+            pass
+
+    # ── FastAPI app ──────────────────────────────────────────────────────────
+
+    app = FastAPI()
+
+    @app.on_event("startup")
+    async def _capture_loop():
+        _loop_ref["v"] = asyncio.get_running_loop()
+
+    for hook in startup_hooks:
+        app.on_event("startup")(hook)
+    for hook in shutdown_hooks:
+        app.on_event("shutdown")(hook)
+
+    # SSE endpoint
+    @app.get("/__pyrex_reload")
+    async def sse_reload():
+        q: asyncio.Queue = asyncio.Queue()
+        with _sse_lock:
+            _sse_queues.append(q)
+
+        async def gen():
+            try:
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(q.get(), timeout=15)
+                        yield msg
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+            finally:
+                with _sse_lock:
+                    if q in _sse_queues:
+                        _sse_queues.remove(q)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # Page GET routes — registered dynamically so the closure captures the right route
+    for route in routes:
+        def _make_page_handler(r: str):
+            async def handler():
+                html = route_cache[r]["html"].replace(
                     "</body>", _SSE_SCRIPT + "\n</body>", 1
                 )
-                data = html.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                return HTMLResponse(html)
+            return handler
 
-            elif self.path == "/__pyrex_reload":
-                # Hold the connection open and stream reload events
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                q: queue.Queue = queue.Queue()
-                with _sse_lock:
-                    _sse_clients.append(q)
+        app.add_api_route(route, _make_page_handler(route), methods=["GET"])
+
+    # Server action POST routes — one per action name
+    for action_name in all_action_names:
+        def _make_action_handler(name: str):
+            async def handler(request: Request):
+                fn = _action_registry.get(name)
+                if fn is None:
+                    return JSONResponse(
+                        {"error": f"No server action registered: {name!r}"},
+                        status_code=404,
+                    )
+
                 try:
-                    while True:
+                    body = await request.json()
+                except Exception:
+                    body = {}
+
+                # Apply type coercion per declared parameter annotations
+                param_types = action_param_types.get(name, [])
+                if param_types:
+                    kwargs: dict = {}
+                    for param_name, type_str in param_types:
+                        if param_name not in body:
+                            continue
                         try:
-                            msg = q.get(timeout=15)  # wake on rebuild signal
-                            self.wfile.write(msg.encode("utf-8"))
-                            self.wfile.flush()
-                        except queue.Empty:
-                            # SSE comment keeps the connection alive through proxies
-                            self.wfile.write(b": keepalive\n\n")
-                            self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
-                finally:
-                    with _sse_lock:
-                        if q in _sse_clients:
-                            _sse_clients.remove(q)
+                            kwargs[param_name] = _coerce_type(body[param_name], type_str)
+                        except (ValueError, TypeError) as e:
+                            return JSONResponse(
+                                {"error": f"Invalid value for {param_name!r}: {e}"},
+                                status_code=422,
+                            )
+                else:
+                    # No annotations — pass all body keys as-is
+                    sig = inspect.signature(fn)
+                    kwargs = {k: v for k, v in body.items() if k in sig.parameters}
 
-            else:
-                self.send_response(404)
-                self.end_headers()
+                try:
+                    if inspect.iscoroutinefunction(fn):
+                        result = await fn(**kwargs)
+                    else:
+                        result = fn(**kwargs)
+                    return JSONResponse(result)
+                except Exception as e:
+                    return JSONResponse(
+                        {"error": f"Action {name!r} raised: {e}"},
+                        status_code=500,
+                    )
 
-        def do_POST(self):
-            if not self.path.startswith("/__pyrex_action/"):
-                self.send_response(404)
-                self.end_headers()
-                return
+            return handler
 
-            action_name = self.path[len("/__pyrex_action/"):]
-            # Strip query string if present
-            if "?" in action_name:
-                action_name = action_name[:action_name.index("?")]
+        app.add_api_route(
+            f"/__pyrex/actions/{action_name}",
+            _make_action_handler(action_name),
+            methods=["POST"],
+        )
 
-            # Parse JSON body
-            content_length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            try:
-                kwargs = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
-                kwargs = {}
-
-            fn = _action_registry.get(action_name)
-            if fn is None:
-                self.send_response(404)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(f"No server action registered: {action_name!r}".encode())
-                return
-
-            try:
-                result = fn(**kwargs)
-                html = str(result) if result is not None else ""
-            except Exception as e:
-                html = (
-                    f'<div style="color:red;padding:.5rem 1rem;font-family:monospace;'
-                    f'border:1px solid #fca5a5;border-radius:4px;background:#fef2f2;">'
-                    f'<strong>Action error</strong> in <code>{action_name}()</code>: {e}</div>'
-                )
-
-            data = html.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, format, *args):
-            pass  # suppress default request logging
+    # ── File watcher (daemon thread) ─────────────────────────────────────────
 
     def watcher():
         while True:
@@ -358,16 +420,7 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
         t = threading.Thread(target=watcher, daemon=True)
         t.start()
 
-    class _Server(ThreadingHTTPServer):
-        def handle_error(self, request, client_address):
-            # Silently ignore aborted connections — common on Windows when
-            # a browser tab is closed or keep-alive sockets are recycled.
-            import sys
-            if isinstance(sys.exc_info()[1], ConnectionAbortedError):
-                return
-            super().handle_error(request, client_address)
-
-    server = _Server(("", port), Handler)
+    # ── Start server ─────────────────────────────────────────────────────────
 
     route_list = "  ".join(routes.keys())
     print(f"\n  Pyrex dev server")
@@ -375,9 +428,8 @@ def serve(directory: str, port: int = 3000, watch: bool = True):
     print(f"  routes: {route_list}")
     if layout_path:
         print(f"  layout: layout.pyx")
+    if all_action_names:
+        print(f"  actions: {', '.join(sorted(all_action_names))}")
     print(f"  Ctrl+C to stop\n")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n  Server stopped.")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
