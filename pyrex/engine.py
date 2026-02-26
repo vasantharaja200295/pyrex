@@ -29,16 +29,23 @@ except Exception:
 
 # ── Action ID helper ─────────────────────────────────────────────────────────
 
-def _make_action_id(fn_name: str, secret_key: str, debug: bool) -> str:
+def _make_action_id(fn_name: str, filepath: str, secret_key: str, debug: bool) -> str:
     """
-    Return the action ID used as the "i" key in /__pyrex/ requests.
+    Return a unique, obfuscated ID for a server action.
 
     dev  (debug=True)  → plain function name
-    prod (debug=False) → sha256(fn_name + secret_key)[:16]
+    prod (debug=False) → sha256(filepath + fn_name + secret_key)[:16]
+    
+    Using the filepath ensures that actions with the same name in different
+    files get different IDs, preventing collisions.
     """
     if debug:
         return fn_name
-    return hashlib.sha256((fn_name + secret_key).encode()).hexdigest()[:16]
+    
+    # Use relative filepath if possible to keep it stable across project moves,
+    # but for server-side registration, we just need uniqueness.
+    payload = f"{filepath}:{fn_name}:{secret_key}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 # ── Type coercion helper (exported for tests) ────────────────────────────────
@@ -183,7 +190,11 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # CSRF token: generated once per server run; empty string in dev mode
     _csrf_token: str = "" if debug else secrets.token_hex(16)
-
+    
+    # Ensure a robust secret exists for action obfuscation in production
+    # Linking it to the CSRF token ensures it changes per run if not fixed in env.
+    action_secret = secret_key or _csrf_token
+    
     directory = os.path.abspath(directory)
     routes = _discover_routes(directory)
     layout_path = _find_layout(directory)
@@ -196,10 +207,8 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     route_cache: dict[str, dict] = {route: {"html": "", "mtime": 0.0} for route in routes}
     layout_mtime: dict[str, float] = {"v": 0.0}
 
-    # Server action registry: action_id → Python callable
-    # In dev mode the ID is the plain function name; in prod it is a sha256 hash.
-    # Each registered action lives in a per-file persistent namespace so that
-    # module-level variables (e.g. in-memory stores) survive across requests.
+    # Per-file action ID map: filepath -> {fn_name: id}
+    _file_action_ids: dict[str, dict[str, str]] = {}
     _action_registry: dict[str, callable] = {}
     _id_to_name: dict[str, str] = {}           # action_id → fn_name
     _action_namespaces: dict[str, dict] = {}   # filepath → exec namespace
@@ -248,7 +257,14 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                 exec(compile(action.body, filepath, "exec"), ns)
                 fn = ns.get(action.name)
                 if callable(fn):
-                    action_id = _make_action_id(action.name, secret_key, debug)
+                    # Use the route-specific ID map
+                    fids = _file_action_ids.get(filepath, {})
+                    action_id = fids.get(action.name)
+                    if not action_id:
+                        action_id = _make_action_id(action.name, filepath, action_secret, debug)
+                        fids[action.name] = action_id
+                        _file_action_ids[filepath] = fids
+                    
                     _action_registry[action_id] = fn
                     _id_to_name[action_id] = action.name
             except Exception as e:
@@ -263,7 +279,7 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     _ws_lock = threading.Lock()
     _loop_ref: dict = {}   # {"v": running asyncio event loop}
 
-    # Injected into every served page (dev-only, never written to disk)
+    # Injected into every served page in dev mode only (never written to disk)
     _RELOAD_SCRIPT = (
         "<script>(function(){"
         "function connect(){"
@@ -274,30 +290,30 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
         "}connect();})();</script>"
     )
 
-    # Collect all action names + param type info from every page file.
-    # Done before _rebuild_route so action_ids is ready for initial builds.
-    all_action_names: set[str] = set()
+    # Collect param type info from every page file.
     action_param_types: dict[str, list[tuple[str, str]]] = {}
     for filepath in routes.values():
         try:
             mod = parse_pyx_file(filepath)
             for a in mod.server_actions:
-                all_action_names.add(a.name)
                 action_param_types[a.name] = a.params
         except Exception:
             pass
 
-    # Build action ID map: fn_name → dispatch ID used in /__pyrex/ "i" key
-    action_ids: dict[str, str] = {
-        name: _make_action_id(name, secret_key, debug)
-        for name in all_action_names
-    }
-
     def _rebuild_route(route: str) -> bool:
         filepath = routes[route]
+        
+        # Reset this file's action namespace so changed code takes effect,
+        # then re-register its server actions. This populates _file_action_ids[filepath].
+        _action_namespaces.pop(filepath, None)
+        _register_actions(filepath)
+        
+        # Get the action IDs specific to this file
+        fids = _file_action_ids.get(filepath, {})
+        
         start = time.monotonic()
         try:
-            html = build_route(filepath, layout_path, action_ids=action_ids)
+            html = build_route(filepath, layout_path, action_ids=fids)
         except Exception as e:
             route_cache[route]["html"] = (
                 f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"
@@ -309,10 +325,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             return False
         route_cache[route]["html"] = html
         route_cache[route]["mtime"] = os.path.getmtime(filepath)
-        # Reset this file's action namespace so changed code takes effect,
-        # then re-register its server actions.
-        _action_namespaces.pop(filepath, None)
-        _register_actions(filepath)
         return True
 
     def _signal_reload():
@@ -343,6 +355,8 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     # Injected into every served page at response time (never written to disk).
     # The CSRF token script runs first so JS proxies can read __PYREX_TOKEN.
     _TOKEN_SCRIPT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
+    # In dev mode also append the hot-reload WebSocket script.
+    _PAGE_INJECT = _TOKEN_SCRIPT + ("\n" + _RELOAD_SCRIPT if debug else "")
 
     app = FastAPI()
 
@@ -363,53 +377,55 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
         app.add_middleware(_LogMiddleware)
 
-    @app.on_event("startup")
-    async def _capture_loop():
-        _loop_ref["v"] = asyncio.get_running_loop()
+    if debug:
+        @app.on_event("startup")
+        async def _capture_loop():
+            _loop_ref["v"] = asyncio.get_running_loop()
 
     for hook in startup_hooks:
         app.on_event("startup")(hook)
     for hook in shutdown_hooks:
         app.on_event("shutdown")(hook)
 
-    @app.on_event("shutdown")
-    async def _close_ws_on_shutdown():
-        """Send shutdown sentinel to all open WebSocket connections."""
-        with _ws_lock:
-            queues = list(_ws_queues)
-        for q in queues:
-            try:
-                q.put_nowait(None)
-            except Exception:
-                pass
-
-    # WebSocket endpoint — each browser tab connects here for hot-reload signals
-    @app.websocket("/__pyrex_ws")
-    async def ws_reload(websocket: WebSocket):
-        await websocket.accept()
-        q: asyncio.Queue = asyncio.Queue()
-        with _ws_lock:
-            _ws_queues.append(q)
-        try:
-            while True:
-                msg = await q.get()
-                if msg is None:   # shutdown sentinel — exit cleanly
-                    break
-                try:
-                    await websocket.send_text(msg)
-                except Exception:
-                    break   # browser disconnected
-        finally:
+    if debug:
+        @app.on_event("shutdown")
+        async def _close_ws_on_shutdown():
+            """Send shutdown sentinel to all open WebSocket connections."""
             with _ws_lock:
-                if q in _ws_queues:
-                    _ws_queues.remove(q)
+                queues = list(_ws_queues)
+            for q in queues:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+
+        # WebSocket endpoint — each browser tab connects here for hot-reload signals
+        @app.websocket("/__pyrex_ws")
+        async def ws_reload(websocket: WebSocket):
+            await websocket.accept()
+            q: asyncio.Queue = asyncio.Queue()
+            with _ws_lock:
+                _ws_queues.append(q)
+            try:
+                while True:
+                    msg = await q.get()
+                    if msg is None:   # shutdown sentinel — exit cleanly
+                        break
+                    try:
+                        await websocket.send_text(msg)
+                    except Exception:
+                        break   # browser disconnected
+            finally:
+                with _ws_lock:
+                    if q in _ws_queues:
+                        _ws_queues.remove(q)
 
     # Page GET routes — registered dynamically so the closure captures the right route
     for route in routes:
         def _make_page_handler(r: str):
             async def handler():
                 html = route_cache[r]["html"].replace(
-                    "</body>", _TOKEN_SCRIPT + "\n" + _RELOAD_SCRIPT + "\n</body>", 1
+                    "</body>", _PAGE_INJECT + "\n</body>", 1
                 )
                 return HTMLResponse(html)
             return handler
@@ -561,8 +577,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
         print(f"\n  Pyrex dev server — {mode}")
         print(f"  http://localhost:{port}")
         print(f"  routes: {route_list}")
-        if all_action_names:
-            print(f"  actions: {', '.join(sorted(all_action_names))} → POST /__pyrex/")
         print(f"  Ctrl+C to stop\n")
 
     try:

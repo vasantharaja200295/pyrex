@@ -311,7 +311,7 @@ async function {action.name}({param_list}) {{
         method: 'POST',
         headers: {{
             'Content-Type': 'application/json',
-            'X-Pyrex-Token': window.__PYREX_TOKEN || '',
+            'x-pyrex-token': window.__PYREX_TOKEN || '',
         }},
         body: JSON.stringify({{ i: {json.dumps(action_id)}, a: {args_obj} }}),
     }});

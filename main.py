@@ -13,4 +13,4 @@ app = Pyrex()
 #     pass
 
 if __name__ == "__main__":
-    app.run(directory="app", port=3000, debug=False, secret_key="3242kffjskldfjfhsdj3242342fd")
+    app.run(directory="app", port=3000, mode="production", secret_key="3242kffjskldfjfhsdj3242342fd")
