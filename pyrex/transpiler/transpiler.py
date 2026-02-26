@@ -272,7 +272,8 @@ class Transpiler:
                 scripts.append(factory)
         if not scripts:
             return ""
-        return "\n<script>\n" + "\n\n".join(scripts) + "\n</script>"
+        content = _minify_js("\n\n".join(scripts))
+        return f"\n<script>{content}</script>"
 
     def _build_component_factory(self, component: ComponentDef) -> str:
         """
@@ -312,14 +313,15 @@ class Transpiler:
         lines.append("}")
         return "\n".join(lines)
 
-    # ── Server action proxies (unchanged from original) ─────────────────────
+    # ── Server action proxies ────────────────────────────────────────────────
 
     def _build_server_action_proxies(self) -> str:
         """
         Generate one named async JS function per @server_action.
 
-        Each proxy calls POST /__pyrex/ with {"i": action_id, "a": params}
-        and returns the parsed JSON response.
+        Each proxy is a thin wrapper that delegates to window.__pyrex.call()
+        defined in pyrex.js. The shared caller owns CSRF token handling,
+        error handling, and the fetch implementation.
         """
         if not self.module.server_actions:
             return ""
@@ -333,26 +335,26 @@ class Transpiler:
             )
             fns.append(f"""
 async function {action.name}({param_list}) {{
-    const res = await fetch('/__pyrex/', {{
-        method: 'POST',
-        headers: {{
-            'Content-Type': 'application/json',
-            'x-pyrex-token': window.__PYREX_TOKEN || '',
-        }},
-        body: JSON.stringify({{ i: {json.dumps(action_id)}, a: {args_obj} }}),
-    }});
-    return await res.json();
+    return await window.__pyrex.call({json.dumps(action_id)}, {args_obj});
 }}""")
-        return "\n<script>" + "".join(fns) + "\n</script>"
+        return f"\n<script>{_minify_js(''.join(fns))}</script>"
 
     def _wrap_html_page(self, body: str, scripts: str) -> str:
-        # Split out the Alpine <script defer> tag so it appears first in <head>,
-        # before the factory / proxy scripts that it depends on.
+        # CDN script tags — order matters for defer execution:
+        #   1. Alpine (defer #1) — must run before factory functions are called
+        #   2. Idiomorph (defer #2) — must be defined before pyrex.js navigate() is called
+        #   3. Component factory / proxy inline scripts — define functions synchronously
+        #      during head parse so they're available when Alpine runs (defer #1)
+        #   4. pyrex.js (defer #3) — sets up navigation, server action caller, hot reload
         alpine_tag = '<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>'
+        idiomorph_tag = '<script defer src="https://cdn.jsdelivr.net/npm/idiomorph@0.3.0/dist/idiomorph.js"></script>'
+        pyrexjs_tag = '<script defer src="/__pyrex_static/pyrex.js"></script>'
+
         rest = scripts.replace(alpine_tag, "").strip()
-        head_content = f"  {alpine_tag}"
+        head_content = f"  {alpine_tag}\n  {idiomorph_tag}"
         if rest:
             head_content += f"\n  {rest}"
+        head_content += f"\n  {pyrexjs_tag}"
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -703,6 +705,85 @@ def _transpile_async_func_to_js_method(source: str, reactive_names: set[str]) ->
 
 
 # ── Event handler expression helpers ───────────────────────────────────────
+
+def _minify_js(src: str) -> str:
+    """
+    Pure-Python JS minifier — no external dependencies required.
+
+    What it does:
+      - Strips // single-line comments and /* */ block comments
+      - Collapses all whitespace sequences (spaces, tabs, newlines) to a single space
+      - Removes spaces around common punctuation ({};,()=)
+      - Preserves the content of string literals exactly (double, single, template)
+
+    What it does NOT do:
+      - Rename variables or function names (true obfuscation requires terser/esbuild)
+      - Mangle or dead-code-eliminate
+
+    For full obfuscation run `npx terser` on the output as a post-build step.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(src)
+
+    while i < n:
+        c = src[i]
+
+        # ── String literal — copy verbatim, respecting backslash escapes ──────
+        if c in ('"', "'", '`'):
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                ch = src[i]
+                if ch == '\\' and i + 1 < n:
+                    out.append(src[i: i + 2])
+                    i += 2
+                    continue
+                out.append(ch)
+                i += 1
+                if ch == quote:
+                    break
+            continue
+
+        # ── // single-line comment ────────────────────────────────────────────
+        if c == '/' and i + 1 < n and src[i + 1] == '/':
+            while i < n and src[i] != '\n':
+                i += 1
+            continue
+
+        # ── /* block comment */ ───────────────────────────────────────────────
+        if c == '/' and i + 1 < n and src[i + 1] == '*':
+            i += 2
+            while i < n - 1 and not (src[i] == '*' and src[i + 1] == '/'):
+                i += 1
+            i += 2  # skip */
+            out.append(' ')  # single space so tokens don't merge
+            continue
+
+        # ── Whitespace — collapse to one space ───────────────────────────────
+        if c in (' ', '\t', '\n', '\r'):
+            out.append(' ')
+            while i < n and src[i] in (' ', '\t', '\n', '\r'):
+                i += 1
+            continue
+
+        out.append(c)
+        i += 1
+
+    joined = ''.join(out)
+
+    # Remove spaces around common punctuation (safe because string contents
+    # were copied verbatim above and won't be matched by these patterns).
+    for op in ('{', '}', ';', ',', '(', ')'):
+        joined = joined.replace(' ' + op, op).replace(op + ' ', op)
+    # Remove spaces around = but not == or !=
+    joined = re.sub(r'(?<![=!<>]) = (?!=)', '=', joined)
+    # Collapse any double-spaces left over
+    joined = re.sub(r' {2,}', ' ', joined)
+
+    return joined.strip()
+
 
 def _substitute_scope_vars(expr: str, scope: dict, state_names: set) -> str:
     """

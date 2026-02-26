@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from pyrex.parser.pyx_parser import parse_pyx_file, parse_pyx_source
-from pyrex.transpiler.transpiler import Transpiler
+from pyrex.transpiler.transpiler import Transpiler, _minify_js
 
 try:
     from pyrex import tui as _tui
@@ -146,6 +146,43 @@ def _find_layout(app_dir: str) -> str | None:
     """Return the absolute path to app/layout.pyx, or None if it doesn't exist."""
     p = Path(app_dir) / "layout.pyx"
     return str(p.resolve()) if p.exists() else None
+
+
+# ── Nav fragment extraction ──────────────────────────────────────────────────
+
+def _extract_nav_fragment(html: str) -> dict:
+    """
+    Extract the data needed for a SPA navigation response from a full HTML page.
+
+    Returns a dict with three keys:
+      html    — innerHTML of the <main> element (or full body if none found)
+      title   — content of the <title> element
+      scripts — list of inline <script> block contents (component factories,
+                action proxies) so the client can define any new component
+                factories the incoming page needs that weren't loaded before
+    """
+    import re as _re
+
+    title_m = _re.search(r'<title[^>]*>(.*?)</title>', html, _re.IGNORECASE | _re.DOTALL)
+    title = title_m.group(1) if title_m else 'Pyrex App'
+
+    main_m = _re.search(r'<main[^>]*>(.*?)</main>', html, _re.IGNORECASE | _re.DOTALL)
+    if main_m:
+        main_html = main_m.group(1)
+    else:
+        # No <main> — extract body as fallback (e.g. pages built without a layout)
+        body_m = _re.search(r'<body[^>]*>(.*?)</body>', html, _re.IGNORECASE | _re.DOTALL)
+        main_html = body_m.group(1) if body_m else ''
+
+    # Collect inline <script> blocks (not CDN src= scripts).
+    # These define component factory functions and server action proxies.
+    scripts = []
+    for m in _re.finditer(r'<script(?:\s[^>]*)?>([^<]+)</script>', html, _re.DOTALL):
+        content = m.group(1).strip()
+        if content:
+            scripts.append(content)
+
+    return {"html": main_html, "title": title, "scripts": scripts}
 
 
 # ── Dev server (FastAPI + uvicorn) ───────────────────────────────────────────
@@ -293,17 +330,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     _ws_lock = threading.Lock()
     _loop_ref: dict = {}   # {"v": running asyncio event loop}
 
-    # Injected into every served page in dev mode only (never written to disk)
-    _RELOAD_SCRIPT = (
-        "<script>(function(){"
-        "function connect(){"
-        "var ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+"
-        "location.host+'/__pyrex_ws');"
-        "ws.onmessage=function(e){if(e.data==='reload')location.reload();};"
-        "ws.onclose=function(){setTimeout(connect,1000);};"
-        "}connect();})();</script>"
-    )
-
     def _rebuild_route(route: str) -> bool:
         filepath = routes[route]
         
@@ -358,23 +384,40 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # _PAGE_INJECT is appended just before </body> at response time (never cached).
     #
-    # Production: inject the CSRF token so JS action proxies can read it and echo
-    #             it back via the x-pyrex-token header.  The token is a random
-    #             32-char hex string generated once per server run.  It MUST be
-    #             readable by same-origin JS — that is how CSRF tokens work.
-    #             Cross-origin scripts cannot access it due to the browser's
-    #             same-origin policy, which is what prevents CSRF attacks.
+    # Production: inject a <meta name="pyrex-csrf"> tag so pyrex.js can read
+    #             the CSRF token and include it in every server action request.
+    #             The token is a random 32-char hex string generated once per
+    #             server run.  It MUST be readable by same-origin JS — that is
+    #             how CSRF tokens work.  Cross-origin scripts cannot access it
+    #             due to the browser's same-origin policy.
     #
-    # Development: CSRF validation is disabled entirely, so there is nothing to
-    #             inject.  The JS proxy uses  window.__PYREX_TOKEN || ''  so it
-    #             degrades gracefully when the variable is not defined.
-    #             Hot-reload WebSocket script is injected instead.
+    # Development: inject a <meta name="pyrex-dev"> tag so pyrex.js activates
+    #             its hot-reload WebSocket connection.  CSRF validation is
+    #             disabled entirely in dev mode so no token is needed.
     if debug:
-        _PAGE_INJECT = _RELOAD_SCRIPT
+        _PAGE_INJECT = '<meta name="pyrex-dev" content="1">'
     else:
-        _PAGE_INJECT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
+        _PAGE_INJECT = f'<meta name="pyrex-csrf" content="{_csrf_token}">'
 
     app = FastAPI()
+
+    # Serve pyrex.js at /__pyrex_static/pyrex.js
+    # We intentionally avoid StaticFiles here because that mount requires the
+    # optional `aiofiles` package.  A plain synchronous route reading the file
+    # with Path.read_text() has no extra dependencies and is fast enough for a
+    # single small file.
+    from fastapi.responses import Response as _Response
+    _pyrexjs_path = Path(__file__).parent / "static" / "pyrex.js"
+    _pyrexjs_minified = (
+        _minify_js(_pyrexjs_path.read_text(encoding="utf-8"))
+        if _pyrexjs_path.exists() else ""
+    )
+
+    @app.get("/__pyrex_static/pyrex.js")
+    def _serve_pyrexjs():
+        if _pyrexjs_minified:
+            return _Response(content=_pyrexjs_minified, media_type="application/javascript")
+        return _Response(content="/* pyrex.js not found */", media_type="application/javascript", status_code=404)
 
     # Request logging middleware.
     # Skips Pyrex-internal paths and browser/OS-injected system requests that
@@ -441,10 +484,14 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                     if q in _ws_queues:
                         _ws_queues.remove(q)
 
-    # Page GET routes — registered dynamically so the closure captures the right route
+    # Page GET routes — registered dynamically so the closure captures the right route.
+    # When the request includes X-Pyrex-Nav: 1 (sent by pyrex.js), return a JSON
+    # fragment instead of the full page so the client can morph only <main>.
     for route in routes:
         def _make_page_handler(r: str):
-            async def handler():
+            async def handler(request: Request):
+                if request.headers.get("x-pyrex-nav") == "1":
+                    return JSONResponse(_extract_nav_fragment(route_cache[r]["html"]))
                 html = route_cache[r]["html"].replace(
                     "</body>", _PAGE_INJECT + "\n</body>", 1
                 )

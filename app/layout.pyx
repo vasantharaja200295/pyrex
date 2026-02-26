@@ -18,6 +18,8 @@ def Layout(children):
     return """ 
     <div style="min-height:100vh;background:#f8fafc;">
         <Header/>
-        <div style="padding:20px; background:#f5ebe0; height:100%; width:100%;">{children}</div>
+        <div style="padding:20px; background:#f5ebe0; height:100%; width:100%;">
+            <main>{children}</main>
+        </div>
     </div>
     """
