@@ -5,10 +5,12 @@ Takes a PyxModule (parsed .pyx file) and outputs a complete HTML page.
 
 Pipeline:
   ComponentDef  →  resolve JSX  →  HTML string
-  use_state     →  JS __state + __setState runtime
-  use_effect    →  JS effect runner
-  onClick etc   →  JS event binding
-  {expr}        →  interpolated value or data-bind attribute
+  use_state     →  Alpine x-data reactive property + setter method
+  use_effect    →  Alpine x-effect directive
+  onClick etc   →  Alpine @click / @input / etc.
+  {expr}        →  static stamped value or x-text binding (for state vars)
+
+Runtime: Alpine.js (CDN, defer) — no __Pyrex global, no window.setter globals.
 """
 
 import ast
@@ -32,39 +34,33 @@ class Transpiler:
             raise ValueError("No root component found. Decorate one with @page or name it with uppercase.")
 
         root = self.component_map[root_name]
-        
-        # Collect all JS needed
-        js_runtime = self._build_js_runtime()
-        component_js = self._build_all_component_js()
+
+        alpine_script = self._build_alpine_script()
+        component_factories = self._build_all_component_factories()
         proxy_js = self._build_server_action_proxies()
 
-        # Render root HTML
         body_html = self._render_component(root, props={})
 
-        return self._wrap_html_page(body_html, js_runtime + "\n" + component_js + "\n" + proxy_js)
+        return self._wrap_html_page(body_html, alpine_script + "\n" + component_factories + "\n" + proxy_js)
 
     def _render_component(self, component: ComponentDef, props: dict) -> str:
         """Render a component to HTML string."""
         if not component.jsx_string:
             return f"<!-- {component.name}: no JSX returned -->"
 
-        # Replace prop references in JSX with their values
         jsx = component.jsx_string
         for prop_name, prop_val in props.items():
-            jsx = jsx.replace(f"{{{prop_name}}}", str(prop_val))
+            prop_str = str(prop_val)
+            if not prop_str.lstrip().startswith("<"):
+                jsx = jsx.replace(f"{{{prop_name}}}", prop_str)
 
         # Build server-side scope: props + inner functions + evaluated local variables
         state_names = {s.var_name for s in component.use_states}
         local_scope: dict = dict(props)
 
         def _globs():
-            # Generator expressions / comprehensions inside eval() look up names in
-            # the *globals* dict, not locals.  Merging local_scope in ensures that
-            # functions defined via exec() and variables already evaluated are visible
-            # to generators, list comps, and other nested scopes.
             return {"__builtins__": __builtins__, **local_scope}
 
-        # Exec inner function defs first so local vars (and inline exprs) can call them
         for lf in component.local_funcs:
             try:
                 exec(compile(lf.source, "<pyrex>", "exec"), _globs(), local_scope)
@@ -79,39 +75,56 @@ class Transpiler:
                     local_scope,
                 )
             except Exception:
-                pass  # falls back to <span data-expr> at render time
+                pass
 
-        # Substitute simple {var_name} references that are not state vars
+        # Substitute server-side variables that are NOT state vars.
+        # Skip any value whose string form is HTML (starts with '<') — those are
+        # safely injected as raw HTML by _node_to_html's expression evaluator.
+        # Inlining raw HTML into the JSX string before parsing breaks the JSX
+        # parser when the HTML contains Alpine @event attributes.
         for var_name, val in local_scope.items():
             if var_name not in state_names:
-                jsx = jsx.replace(f"{{{var_name}}}", str(val))
+                val_str = str(val)
+                if not val_str.lstrip().startswith("<"):
+                    jsx = jsx.replace(f"{{{var_name}}}", val_str)
 
-        # Store scope so _node_to_html can eval complex expressions like {x.upper()}
         self._render_scope = local_scope
 
-        # For state variables, inject placeholder spans that JS will hydrate
+        # State variable references → x-text spans (Alpine keeps them updated)
         for state in component.use_states:
-            initial = _py_value_to_js_literal(state.initial_value)
-            # Replace {count} with a span that JS controls
             jsx = re.sub(
                 rf'\{{{re.escape(state.var_name)}\}}',
-                f'<span data-state="{state.var_name}" data-component="{component.name}">{_strip_quotes(state.initial_value)}</span>',
+                f'<span x-text="{state.var_name}"></span>',
                 jsx
             )
 
-        # Parse the JSX and render to HTML
         try:
             ast_node = parse_jsx(jsx)
+        except Exception as e:
+            return f'<div style="color:red;padding:1rem;">JSX Parse Error in {component.name}: {e}</div>'
+
+        # Attach Alpine directives to the root element if the component has reactive state
+        needs_alpine = bool(component.use_states or component.local_async_funcs)
+        if needs_alpine and isinstance(ast_node, JSXNode):
+            ast_node.props['x-data'] = f"__pyrex_{component.name}()"
+
+        if component.use_effects and isinstance(ast_node, JSXNode):
+            effect_bodies = []
+            for effect in component.use_effects:
+                js_body = _py_expr_to_js(effect.callback_body, component)
+                effect_bodies.append(js_body)
+            ast_node.props['x-effect'] = "; ".join(effect_bodies)
+
+        try:
             html = self._node_to_html(ast_node, component)
         except Exception as e:
-            html = f'<div style="color:red;padding:1rem;">JSX Parse Error in {component.name}: {e}</div>'
+            html = f'<div style="color:red;padding:1rem;">Render Error in {component.name}: {e}</div>'
 
         return html
 
     def _node_to_html(self, node, component: ComponentDef) -> str:
         if isinstance(node, TextNode):
             if node.is_expression:
-                # Try to evaluate against the server-side scope (handles {x.upper()} etc.)
                 scope = getattr(self, "_render_scope", None)
                 if scope is not None:
                     try:
@@ -121,8 +134,6 @@ class Transpiler:
                             scope,
                         )
                         result_str = str(result)
-                        # If the result is already markup, inject raw (list rendering,
-                        # conditional HTML blocks, helper functions that return tags).
                         if result_str.lstrip().startswith("<"):
                             return result_str
                         return _escape_html(result_str)
@@ -132,22 +143,25 @@ class Transpiler:
             return _escape_html(node.content)
 
         if isinstance(node, JSXNode):
-            # Is this a component reference?
             if node.component and node.tag in self.component_map:
                 child_comp = self.component_map[node.tag]
-                # Resolve props
                 child_props = {}
                 for k, v in node.props.items():
                     if isinstance(v, str) and v.startswith('_expr_:'):
-                        child_props[k] = v[7:]  # pass expression as-is for now
+                        child_props[k] = v[7:]
                     else:
                         child_props[k] = v
-                return self._render_component(child_comp, child_props)
+                # Save and restore _render_scope: child renders overwrite it,
+                # which would corrupt expression evaluation in the parent scope
+                # (e.g. {children} evaluated after <Header/> would lose its value).
+                saved_scope = getattr(self, "_render_scope", None)
+                result = self._render_component(child_comp, child_props)
+                self._render_scope = saved_scope
+                return result
 
-            # Regular HTML element
             tag = node.tag
             attrs = self._build_attrs(node.props, component)
-            
+
             if node.self_closing:
                 return f'<{tag}{attrs} />'
 
@@ -160,27 +174,53 @@ class Transpiler:
         return ""
 
     def _build_attrs(self, props: dict, component: ComponentDef) -> str:
-        """Convert JSX props to HTML attributes, translating event handlers."""
+        """Convert JSX props to HTML attributes, translating event handlers to Alpine directives."""
         parts = []
         state_names = {s.var_name for s in component.use_states}
-        setter_names = {s.setter_name: s.var_name for s in component.use_states}
-
         scope = getattr(self, "_render_scope", {})
-        state_names = {s.var_name for s in component.use_states}
 
         for key, val in props.items():
-            # Event handler props (camelCase: onClick, onInput, onKeyDown …)
+            # Alpine pass-through directives (x-data, x-text, x-effect already set directly)
+            if key.startswith('x-') or key.startswith('@'):
+                parts.append(f'{key}="{val}"')
+                continue
+
+            # camelCase JSX event props: onClick, onChange, onSubmit, etc.
             if key.startswith('on') and len(key) > 2 and key[2].isupper():
-                html_event = _jsx_event_to_html(key)
+                alpine_attr = _jsx_event_to_alpine(key)
                 if isinstance(val, str) and val.startswith('_expr_:'):
                     expr = val[7:]
                     try:
-                        js_expr = _handle_event_expr(expr, component, scope, state_names)
+                        js_expr = _handle_event_expr_alpine(expr, component, scope, state_names)
                     except ValueError as e:
                         raise ValueError(f"In component {component.name!r}: {e}") from e
-                    parts.append(f'{html_event}="{js_expr}"')
+                    parts.append(f'{alpine_attr}="{js_expr}"')
                 else:
-                    parts.append(f'{html_event}="{val}"')
+                    parts.append(f'{alpine_attr}="{val}"')
+                continue
+
+            # Lowercase HTML event attrs: onclick, oninput, onkeydown, etc.
+            #
+            # Alpine only processes @event directives for elements inside an x-data
+            # scope.  Stateful components always have x-data on their root element, so
+            # @event works there.  Stateless components (no use_state, no async funcs)
+            # have NO x-data, so Alpine never attaches the listener — the button does
+            # nothing.  For those, emit the plain native on* attribute instead.
+            if key.startswith('on') and len(key) > 2 and not key[2].isupper():
+                event_name = key[2:]   # "click", "input", "keydown", …
+                if isinstance(val, str) and val.startswith('_expr_:'):
+                    js_expr = _py_expr_to_js(val[7:], component)
+                else:
+                    js_expr = val if isinstance(val, str) else str(val)
+                if component.use_states or component.local_async_funcs:
+                    # Stateful component — Alpine @event directive.
+                    # Replace 'event' with Alpine's '$event' magic identifier.
+                    js_expr = re.sub(r'\bevent\b', lambda _: '$event', js_expr)
+                    parts.append(f'@{event_name}="{js_expr}"')
+                else:
+                    # Stateless component — keep as a native on* attribute.
+                    # 'event' and 'this' behave exactly as in plain HTML here.
+                    parts.append(f'{key}="{js_expr}"')
                 continue
 
             # className → class
@@ -196,7 +236,6 @@ class Transpiler:
                     parts.append(key)
             elif isinstance(val, str) and val.startswith('_expr_:'):
                 expr = val[7:]
-                # Try to resolve as a server-side expression first
                 scope = getattr(self, "_render_scope", None)
                 if scope is not None:
                     try:
@@ -209,7 +248,6 @@ class Transpiler:
                         continue
                     except Exception:
                         pass
-                # Fall back to JS expression translation
                 js_val = _py_expr_to_js(expr, component)
                 parts.append(f'{key}="{js_val}"')
             else:
@@ -217,83 +255,71 @@ class Transpiler:
 
         return (" " + " ".join(parts)) if parts else ""
 
-    def _build_js_runtime(self) -> str:
-        """The core Pyrex JS runtime — state management, effects, bindings."""
-        return """
-<script>
-// ── Pyrex Runtime ──────────────────────────────────────────────────────────
-const __Pyrex = {
-  state: {},
-  effects: [],
-  listeners: {},
+    # ── Alpine script tag ───────────────────────────────────────────────────
 
-  setState(component, key, value) {
-    const stateKey = component + '.' + key;
-    this.state[stateKey] = value;
+    def _build_alpine_script(self) -> str:
+        """Return a <script defer> tag that loads Alpine.js from CDN."""
+        return '<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>'
 
-    // Update all DOM nodes bound to this state
-    document.querySelectorAll(
-      `[data-state="${key}"][data-component="${component}"]`
-    ).forEach(el => {
-      el.textContent = Array.isArray(value) ? value.join(', ') : value;
-    });
+    # ── Component factory functions for x-data ──────────────────────────────
 
-    // Update input values
-    document.querySelectorAll(
-      `[data-bind="${key}"][data-component="${component}"]`
-    ).forEach(el => {
-      el.value = value;
-    });
+    def _build_all_component_factories(self) -> str:
+        """Generate Alpine x-data factory functions for all stateful components."""
+        scripts = []
+        for comp in self.module.components:
+            factory = self._build_component_factory(comp)
+            if factory:
+                scripts.append(factory)
+        if not scripts:
+            return ""
+        return "\n<script>\n" + "\n\n".join(scripts) + "\n</script>"
 
-    // Run effects that depend on this key
-    this.runEffects(component, key);
-  },
+    def _build_component_factory(self, component: ComponentDef) -> str:
+        """
+        Generate a JS factory function for a component's Alpine x-data object.
 
-  getState(component, key) {
-    return this.state[component + '.' + key];
-  },
+        The factory is called once per component instance via x-data="__pyrex_Name()".
+        Each call returns a fresh reactive object, so multiple instances of the
+        same component are fully isolated.
 
-  registerEffect(component, deps, fn) {
-    this.effects.push({ component, deps, fn });
-    fn(); // run immediately (like useEffect with deps)
-  },
+        The object contains:
+          1. State variables as properties (initial values)
+          2. Setter methods named exactly as declared in use_state
+          3. Async client-side handler methods (translated from Python)
+        """
+        if not component.use_states and not component.local_async_funcs:
+            return ""
 
-  runEffects(component, changedKey) {
-    this.effects.forEach(effect => {
-      if (effect.component === component && effect.deps.includes(changedKey)) {
-        effect.fn();
-      }
-    });
-  },
+        state_names = {s.var_name for s in component.use_states}
+        setter_names = {s.setter_name for s in component.use_states}
+        reactive_names = state_names | setter_names
 
-  init() {
-    // Initialize state from data-state-init attributes
-    document.querySelectorAll('[data-state-init]').forEach(el => {
-      const component = el.dataset.component;
-      const key = el.dataset.stateInit;
-      const raw = el.dataset.stateValue;
-      let value;
-      try { value = JSON.parse(raw); } catch { value = raw; }
-      this.state[component + '.' + key] = value;
-    });
-  }
-};
+        lines = [f"function __pyrex_{component.name}() {{", "  return {"]
 
-document.addEventListener('DOMContentLoaded', () => __Pyrex.init());
+        for state in component.use_states:
+            initial = _py_value_to_js_literal(state.initial_value)
+            lines.append(f"    {state.var_name}: {initial},")
+            lines.append(f"    {state.setter_name}(val) {{ this.{state.var_name} = val; }},")
 
-// ───────────────────────────────────────────────────────────────────────────
-</script>"""
+        for laf in component.local_async_funcs:
+            try:
+                method_js = _transpile_async_func_to_js_method(laf.source, reactive_names)
+                lines.append(f"    {method_js},")
+            except Exception as e:
+                lines.append(f"    /* {laf.name}: transpile error: {e} */")
+
+        lines.append("  };")
+        lines.append("}")
+        return "\n".join(lines)
+
+    # ── Server action proxies (unchanged from original) ─────────────────────
 
     def _build_server_action_proxies(self) -> str:
         """
         Generate one named async JS function per @server_action.
 
         Each proxy calls POST /__pyrex/ with {"i": action_id, "a": params}
-        and returns the parsed JSON response. The action ID is the function
-        name in dev mode or a sha256 hash in production mode.
-        Developers call these functions directly from event handlers:
-
-            onclick="add_todo(input_val).then(d => set_count(d.count))"
+        and returns the parsed JSON response.
         """
         if not self.module.server_actions:
             return ""
@@ -319,77 +345,14 @@ async function {action.name}({param_list}) {{
 }}""")
         return "\n<script>" + "".join(fns) + "\n</script>"
 
-    def _build_all_component_js(self) -> str:
-        """Generate JS for each component: async funcs first, then state/effects."""
-        scripts = []
-        for comp in self.module.components:
-            # Async client-side functions emitted BEFORE state so that setters
-            # called inside them are already defined when DOMContentLoaded fires.
-            async_js = self._build_component_async_funcs(comp)
-            if async_js:
-                scripts.append(async_js)
-            js = self._build_component_js(comp)
-            if js:
-                scripts.append(js)
-        return "\n".join(scripts)
-
-    def _build_component_async_funcs(self, component: ComponentDef) -> str:
-        """
-        Transpile async def functions from the component body to JS async functions.
-
-        Each async def inside a @page/@component is a CLIENT-SIDE function —
-        it runs in the browser. The transpiler converts it to a JS async function
-        and injects it into the page as a <script> block.
-        """
-        if not component.local_async_funcs:
-            return ""
-        fns = []
-        for laf in component.local_async_funcs:
-            try:
-                fns.append(_transpile_async_func_to_js(laf.source))
-            except Exception as e:
-                fns.append(f"/* async func {laf.name} failed to transpile: {e} */")
-        return "\n<script>\n" + "\n\n".join(fns) + "\n</script>"
-
-    def _build_component_js(self, component: ComponentDef) -> str:
-        if not component.use_states and not component.use_effects:
-            return ""
-
-        lines = [f"\n<script>"]
-        lines.append(f"// Component: {component.name}")
-        lines.append(f"document.addEventListener('DOMContentLoaded', function() {{")
-
-        # Initialize state
-        for state in component.use_states:
-            initial_js = _py_value_to_js_literal(state.initial_value)
-            lines.append(f"  __Pyrex.state['{component.name}.{state.var_name}'] = {initial_js};")
-            # Expose setter as a global function components can call
-            lines.append(
-                f"  window.{state.setter_name} = function(val) {{ "
-                f"__Pyrex.setState('{component.name}', '{state.var_name}', val); }};"
-            )
-            # Expose getter
-            lines.append(
-                f"  Object.defineProperty(window, '{state.var_name}', {{ "
-                f"get() {{ return __Pyrex.getState('{component.name}', '{state.var_name}'); }}, "
-                f"configurable: true }});"
-            )
-
-        # Register effects
-        for effect in component.use_effects:
-            deps_js = json.dumps(effect.deps)
-            # Translate Python lambda body to JS
-            js_body = _py_expr_to_js(effect.callback_body, component)
-            lines.append(
-                f"  __Pyrex.registerEffect('{component.name}', {deps_js}, function() {{ {js_body}; }});"
-            )
-
-        lines.append("});")
-        lines.append("</script>")
-
-        return "\n".join(lines)
-
     def _wrap_html_page(self, body: str, scripts: str) -> str:
+        # Split out the Alpine <script defer> tag so it appears first in <head>,
+        # before the factory / proxy scripts that it depends on.
+        alpine_tag = '<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>'
+        rest = scripts.replace(alpine_tag, "").strip()
+        head_content = f"  {alpine_tag}"
+        if rest:
+            head_content += f"\n  {rest}"
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -400,7 +363,7 @@ async function {action.name}({param_list}) {{
     *, *::before, *::after {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: system-ui, sans-serif; }}
   </style>
-  {scripts.replace('<script>', '<script>', 1) if '<script>' in scripts else ''}
+{head_content}
 </head>
 <body>
 {body}
@@ -414,27 +377,101 @@ async function {action.name}({param_list}) {{
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _jsx_event_to_html(jsx_event: str) -> str:
-    """onClick → onclick, onChange → oninput, onSubmit → onsubmit"""
+def _jsx_event_to_alpine(jsx_event: str) -> str:
+    """
+    Translate a camelCase JSX event prop to an Alpine @event directive name.
+
+    onClick → @click, onChange → @change, onSubmit → @submit, etc.
+    """
     mapping = {
-        'onClick': 'onclick',
-        'onChange': 'oninput',
-        'onSubmit': 'onsubmit',
-        'onInput': 'oninput',
-        'onKeyDown': 'onkeydown',
-        'onKeyUp': 'onkeyup',
-        'onFocus': 'onfocus',
-        'onBlur': 'onblur',
-        'onMouseEnter': 'onmouseenter',
-        'onMouseLeave': 'onmouseleave',
+        'onClick':      '@click',
+        'onChange':     '@change',
+        'onSubmit':     '@submit',
+        'onInput':      '@input',
+        'onKeyDown':    '@keydown',
+        'onKeyUp':      '@keyup',
+        'onFocus':      '@focus',
+        'onBlur':       '@blur',
+        'onMouseEnter': '@mouseenter',
+        'onMouseLeave': '@mouseleave',
     }
-    return mapping.get(jsx_event, jsx_event.lower())
+    if jsx_event in mapping:
+        return mapping[jsx_event]
+    # Generic fallback: onFooBar → @foobar
+    return '@' + jsx_event[2:].lower()
 
 
-def _py_expr_to_js(expr: str, component: ComponentDef) -> str:
+def _handle_event_expr_alpine(
+    expr: str,
+    component,
+    scope: dict | None = None,
+    state_names: set | None = None,
+) -> str:
+    """
+    Translate an event-handler JSX expression to an Alpine-compatible JS string.
+
+    Pattern 1 — bare function reference:
+        {handle_submit}  →  "handle_submit()"
+
+    Pattern 2 — lambda with no event parameter:
+        {lambda: set_count(count + 1)}  →  "set_count(count + 1)"
+        Server-side scope variables are stamped as literals.
+
+    Pattern 3 — lambda with an event parameter:
+        {lambda e: set_name(e.target.value)}  →  "set_name($event.target.value)"
+        The parameter name is replaced with Alpine's $event identifier.
+
+    Error — direct function call (not wrapped in a lambda):
+        {handle_add()}  →  raises ValueError with a clear message
+    """
+    import ast as _ast
+
+    expr = expr.strip()
+    scope = scope or {}
+    state_names = state_names or set()
+
+    # Pattern 3: lambda <param>: <body>
+    m = re.match(r'^lambda\s+(\w+)\s*:\s*(.+)$', expr, re.DOTALL)
+    if m:
+        param_name = m.group(1)
+        body = m.group(2).strip()
+        # Replace the param name with Alpine's $event ($ needs escaping in re.sub)
+        body = re.sub(r'\b' + re.escape(param_name) + r'\b', lambda _: '$event', body)
+        return _py_expr_to_js(body, component)
+
+    # Pattern 2: lambda: <body>  (no parameter)
+    if expr.startswith('lambda:'):
+        body = expr[7:].strip()
+        body = _substitute_scope_vars(body, scope, state_names)
+        return _py_expr_to_js(body, component)
+
+    # Error case: detect a plain function call (not wrapped in a lambda)
+    try:
+        tree = _ast.parse(expr, mode='eval')
+        if (isinstance(tree.body, _ast.Call)
+                and isinstance(tree.body.func, _ast.Name)):
+            name = tree.body.func.id
+            raise ValueError(
+                f"`{{{expr}}}` calls `{name}` at render time — the return value becomes "
+                f"the handler, not the function itself. "
+                f"Use a bare reference `{{{name}}}` to call it with no args, "
+                f"or a lambda `{{lambda: {expr}}}` to call it with args."
+            )
+    except SyntaxError:
+        pass
+
+    # Pattern 1: bare name  →  name()
+    if re.match(r'^\w+$', expr):
+        return expr + '()'
+
+    # Fallback: generic expression translation
+    return _py_expr_to_js(expr, component)
+
+
+def _py_expr_to_js(expr: str, component) -> str:
     """
     Best-effort Python expression → JavaScript expression.
-    Handles the common patterns that appear in event handlers.
+    Handles the common patterns that appear in event handlers and effects.
     """
     # lambda: body  →  body
     if expr.startswith('lambda:'):
@@ -446,11 +483,11 @@ def _py_expr_to_js(expr: str, component: ComponentDef) -> str:
     # not x → !x
     expr = re.sub(r'\bnot\s+(\w+)', r'!\1', expr)
 
-    # True/False → true/false
+    # True/False/None → JS equivalents
     expr = expr.replace('True', 'true').replace('False', 'false')
     expr = expr.replace('None', 'null')
 
-    # f"...{var}..." → `...${var}...`  (basic f-string)
+    # f"...{var}..." → `...${var}...`
     def fstring_to_template(m):
         content = m.group(1)
         content = re.sub(r'\{(\w+)\}', r'${$1}', content)
@@ -475,9 +512,8 @@ def _py_value_to_js_literal(py_val: str) -> str:
     if py_val == 'None':
         return 'null'
     if py_val.startswith(('[', '{')):
-        return py_val  # close enough for basic cases
+        return py_val
     if py_val.startswith(("'", '"')):
-        # Python string → JS string
         return py_val
     return py_val  # numbers pass through as-is
 
@@ -503,15 +539,12 @@ def _escape_html(text: str) -> str:
 def _py_expr_node_to_js(node: ast.expr) -> str:
     """
     Translate an AST expression node to a JavaScript expression string.
-
-    Uses the Python AST directly (not string-based regex) for correctness.
-    Covers the patterns that appear in async component functions.
+    Uses the Python AST directly for correctness.
     """
     if isinstance(node, ast.Await):
         return f"await {_py_expr_node_to_js(node.value)}"
 
     if isinstance(node, ast.Call):
-        # Python builtins → JS equivalents
         if isinstance(node.func, ast.Name):
             if node.func.id == "len" and len(node.args) == 1:
                 return f"{_py_expr_node_to_js(node.args[0])}.length"
@@ -543,7 +576,7 @@ def _py_expr_node_to_js(node: ast.expr) -> str:
         obj = _py_expr_node_to_js(node.value)
         slc = node.slice
         if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
-            return f"{obj}.{slc.value}"   # obj["key"] → obj.key
+            return f"{obj}.{slc.value}"
         return f"{obj}[{_py_expr_node_to_js(slc)}]"
 
     if isinstance(node, ast.JoinedStr):
@@ -582,7 +615,6 @@ def _py_expr_node_to_js(node: ast.expr) -> str:
         )
         return "{" + pairs + "}"
 
-    # Fallback: unparse back to string and run through the regex-based converter
     return _py_expr_to_js(ast.unparse(node), None)
 
 
@@ -618,16 +650,14 @@ def _py_stmt_to_js_line(stmt: ast.stmt) -> str:
             return f"if ({cond}) {{ {body} }} else {{ {else_body} }}"
         return f"if ({cond}) {{ {body} }}"
 
-    # Unknown statement — emit a comment so the function still parses
     return f"/* {ast.unparse(stmt)} */"
 
 
 def _transpile_async_func_to_js(source: str) -> str:
     """
-    Convert an `async def` Python function to a JS `async function`.
-
-    Used for client-side async functions defined inside @page/@component bodies.
-    The body is translated statement-by-statement using the AST.
+    Convert an `async def` Python function to a standalone JS `async function`.
+    Kept for backwards compatibility; new code should use
+    _transpile_async_func_to_js_method for Alpine x-data methods.
     """
     tree = ast.parse(source)
     fn = tree.body[0]
@@ -640,81 +670,46 @@ def _transpile_async_func_to_js(source: str) -> str:
     return f"async function {fn.name}({params}) {{\n    {body}\n}}"
 
 
+def _transpile_async_func_to_js_method(source: str, reactive_names: set[str]) -> str:
+    """
+    Convert an `async def` Python function to an Alpine x-data method.
+
+    The result is a method definition (no `function` keyword) suitable for
+    placement inside the object returned by a factory function:
+
+        async handle_submit(arg) {
+            const result = await some_action(this.count);
+            this.set_count(result.value);
+        }
+
+    References to reactive_names (state vars and their setters) are prefixed
+    with `this.` so they access the Alpine reactive object correctly.
+    """
+    tree = ast.parse(source)
+    fn = tree.body[0]
+    if not isinstance(fn, ast.AsyncFunctionDef):
+        raise TypeError(f"Expected AsyncFunctionDef, got {type(fn).__name__}")
+
+    params = ", ".join(arg.arg for arg in fn.args.args)
+    body_lines = [_py_stmt_to_js_line(stmt) for stmt in fn.body]
+    body = "\n    ".join(body_lines)
+
+    # Prefix reactive names with this. — longest names first to avoid
+    # partial-match issues (e.g. "count" before "set_count").
+    for name in sorted(reactive_names, key=len, reverse=True):
+        body = re.sub(r'\b' + re.escape(name) + r'\b', f'this.{name}', body)
+
+    return f"async {fn.name}({params}) {{\n    {body}\n  }}"
+
+
 # ── Event handler expression helpers ───────────────────────────────────────
-
-def _handle_event_expr(
-    expr: str,
-    component,
-    scope: dict | None = None,
-    state_names: set | None = None,
-) -> str:
-    """
-    Translate an event-handler JSX expression to an inline JS string.
-
-    Pattern 1 — bare function reference:
-        {handle_add}  →  "handle_add()"
-
-    Pattern 2 — lambda with no event parameter:
-        {lambda: delete_item(item_id)}  →  "delete_item('abc')"
-        Server-side variables in scope are stamped as literals; state vars
-        are left as JS getter references.
-
-    Pattern 3 — lambda with an event parameter:
-        {lambda e: set_name(e.target.value)}  →  "set_name(event.target.value)"
-        The parameter name is replaced with the standard JS 'event' identifier.
-
-    Error — direct function call (not wrapped in a lambda):
-        {handle_add()}  →  raises ValueError with a clear message
-    """
-    import ast as _ast
-
-    expr = expr.strip()
-    scope = scope or {}
-    state_names = state_names or set()
-
-    # Pattern 3: lambda <param>: <body>
-    m = re.match(r'^lambda\s+(\w+)\s*:\s*(.+)$', expr, re.DOTALL)
-    if m:
-        param_name = m.group(1)
-        body = m.group(2).strip()
-        body = re.sub(r'\b' + re.escape(param_name) + r'\b', 'event', body)
-        return _py_expr_to_js(body, component)
-
-    # Pattern 2: lambda: <body>  (no parameter — server vars get stamped)
-    if expr.startswith('lambda:'):
-        body = expr[7:].strip()
-        body = _substitute_scope_vars(body, scope, state_names)
-        return _py_expr_to_js(body, component)
-
-    # Error case: detect a plain function call (not wrapped in a lambda)
-    try:
-        tree = _ast.parse(expr, mode='eval')
-        if (isinstance(tree.body, _ast.Call)
-                and isinstance(tree.body.func, _ast.Name)):
-            name = tree.body.func.id
-            raise ValueError(
-                f"`{{{expr}}}` calls `{name}` at render time — the return value becomes "
-                f"the handler, not the function itself. "
-                f"Use a bare reference `{{{name}}}` to call it with no args, "
-                f"or a lambda `{{lambda: {expr}}}` to call it with args."
-            )
-    except SyntaxError:
-        pass
-
-    # Pattern 1: bare name  →  name()
-    if re.match(r'^\w+$', expr):
-        return expr + '()'
-
-    # Fallback: generic expression translation
-    return _py_expr_to_js(expr, component)
-
 
 def _substitute_scope_vars(expr: str, scope: dict, state_names: set) -> str:
     """
     Replace bare variable references in a JS expression with their
     server-side literal values (evaluated at transpile time).
 
-    State variables are skipped so they remain as live JS getter references.
+    State variables are skipped so they remain as live Alpine reactive references.
     """
     for var_name, val in scope.items():
         if var_name in state_names:
@@ -722,7 +717,7 @@ def _substitute_scope_vars(expr: str, scope: dict, state_names: set) -> str:
         if not re.search(r'\b' + re.escape(var_name) + r'\b', expr):
             continue
         if isinstance(val, str):
-            replacement = json.dumps(val)       # properly quoted JS string
+            replacement = json.dumps(val)
         elif isinstance(val, bool):
             replacement = 'true' if val else 'false'
         elif val is None:
@@ -730,6 +725,6 @@ def _substitute_scope_vars(expr: str, scope: dict, state_names: set) -> str:
         elif isinstance(val, (int, float)):
             replacement = str(val)
         else:
-            continue                            # skip complex objects
+            continue
         expr = re.sub(r'\b' + re.escape(var_name) + r'\b', replacement, expr)
     return expr

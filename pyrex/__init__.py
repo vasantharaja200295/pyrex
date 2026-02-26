@@ -5,7 +5,9 @@ The transpiler parses .pyx files as Python AST and never executes them, so
 these decorators and hooks only need to exist so that `from pyrex import ...`
 doesn't fail when a user runs a .pyx file directly with Python.
 """
+import asyncio
 import functools
+import inspect
 
 
 def page(fn):
@@ -35,11 +37,13 @@ def use_effect(fn, deps=None):  # noqa: ARG001
 
 def server_action(fn):
     """
-    Mark an async function as a Pyrex server action.
+    Mark a function as a Pyrex server action.
 
     The function is dispatched through the single POST /__pyrex/ endpoint.
     It receives JSON-decoded keyword arguments from the client and must return
     a JSON-serializable value (dict, list, str, int, float, bool, or None).
+
+    Both ``async def`` and plain ``def`` functions are supported.
 
     A named JS proxy function is auto-generated in every served page so callers
     can invoke the action by name with exact parameter names:
@@ -54,7 +58,10 @@ def server_action(fn):
     """
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
-        return await fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     wrapper.__pyrex_server_action__ = True
     return wrapper

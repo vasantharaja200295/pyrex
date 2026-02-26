@@ -29,22 +29,21 @@ except Exception:
 
 # ── Action ID helper ─────────────────────────────────────────────────────────
 
-def _make_action_id(fn_name: str, filepath: str, secret_key: str, debug: bool) -> str:
+def _make_action_id(fn_name: str, filepath: str, build_id: str) -> str:
     """
-    Return a unique, obfuscated ID for a server action.
+    Return an opaque, unique ID for a server action.
 
-    dev  (debug=True)  → plain function name
-    prod (debug=False) → sha256(filepath + fn_name + secret_key)[:16]
-    
+    Always hashes  build_id + filepath + fn_name  via SHA-256, returning the
+    first 16 hex characters.
+
+    The build_id is generated fresh per server run (secrets.token_hex(16)) so
+    action IDs rotate on every restart, making stale browser-cached pages
+    unable to call actions after a redeploy.
+
     Using the filepath ensures that actions with the same name in different
-    files get different IDs, preventing collisions.
+    files receive different IDs, preventing collisions across routes.
     """
-    if debug:
-        return fn_name
-    
-    # Use relative filepath if possible to keep it stable across project moves,
-    # but for server-side registration, we just need uniqueness.
-    payload = f"{filepath}:{fn_name}:{secret_key}"
+    payload = f"{build_id}:{filepath}:{fn_name}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -117,11 +116,11 @@ def build_route(page_filepath: str, layout_filepath: str | None = None,
     lt = Transpiler(layout_module, action_ids=action_ids)
     layout_body = lt._render_component(layout_comp, {"children": page_body})
 
-    all_js = (pt._build_js_runtime() + "\n"
-              + pt._build_all_component_js() + "\n"
-              + lt._build_all_component_js() + "\n"
-              + pt._build_server_action_proxies())
-    return pt._wrap_html_page(layout_body, all_js)
+    all_scripts = (pt._build_alpine_script() + "\n"
+                   + pt._build_all_component_factories() + "\n"
+                   + lt._build_all_component_factories() + "\n"
+                   + pt._build_server_action_proxies())
+    return pt._wrap_html_page(layout_body, all_scripts)
 
 
 # ── Directory scanning ───────────────────────────────────────────────────────
@@ -165,10 +164,11 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
                     directory/about/page.pyx     → /about
                     directory/blog/post/page.pyx → /blog/post
 
-    mode="development" (default): debug-friendly — plain action IDs, full error
-                                   details, no CSRF/origin enforcement.
-    mode="production":             sha256 action IDs, CSRF token + Origin header
-                                   validation, opaque error responses.
+    mode="development" (default): debug-friendly — full error details, no
+                                   CSRF/origin enforcement.  Action IDs are
+                                   still opaque hashes (same as production).
+    mode="production":             CSRF token + Origin header validation,
+                                   opaque error responses.
 
     on_ready is an optional callable invoked after the initial build is complete
     and just before uvicorn starts. Use it to print the "ready" banner and start
@@ -190,11 +190,13 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # CSRF token: generated once per server run; empty string in dev mode
     _csrf_token: str = "" if debug else secrets.token_hex(16)
-    
-    # Ensure a robust secret exists for action obfuscation in production
-    # Linking it to the CSRF token ensures it changes per run if not fixed in env.
-    action_secret = secret_key or _csrf_token
-    
+
+    # Per-run build ID — incorporated into every action ID so they are opaque
+    # and rotate on every server restart.  Mirrors Next.js's per-build action
+    # ID scheme: IDs are unpredictable, never expose function names, and become
+    # invalid after a redeploy (browser reloads get fresh IDs from the new page).
+    _build_id: str = secrets.token_hex(16)
+
     directory = os.path.abspath(directory)
     routes = _discover_routes(directory)
     layout_path = _find_layout(directory)
@@ -210,11 +212,21 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
     # Per-file action ID map: filepath -> {fn_name: id}
     _file_action_ids: dict[str, dict[str, str]] = {}
     _action_registry: dict[str, callable] = {}
-    _id_to_name: dict[str, str] = {}           # action_id → fn_name
-    _action_namespaces: dict[str, dict] = {}   # filepath → exec namespace
+    _id_to_name: dict[str, str] = {}                      # action_id → fn_name
+    _action_param_types: dict[str, list] = {}             # action_id → [(param, type), …]
+    _action_namespaces: dict[str, dict] = {}              # filepath → exec namespace
 
     def _register_actions(filepath: str) -> None:
-        """Parse filepath and exec all @server_action functions into the registry."""
+        """
+        Parse filepath and exec all @server_action functions into the registry.
+
+        Action IDs are derived from (build_id, filepath, fn_name) via SHA-256 so
+        they are always opaque — function names are never exposed to the client —
+        and rotate with every server restart.
+
+        _action_param_types is keyed by action_id (not by fn_name) so that two
+        files with identically-named actions receive distinct type-validation rules.
+        """
         try:
             module = parse_pyx_file(filepath)
         except Exception:
@@ -251,22 +263,24 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             except Exception:
                 pass
 
-        # Exec each action function and register under its computed ID
+        # Compute the stable ID map for this file (IDs are fixed for the server run)
+        fids = _file_action_ids.setdefault(filepath, {})
+
+        # Exec each action function and register under its opaque ID
         for action in module.server_actions:
+            # Compute (or reuse) the opaque action ID
+            if action.name not in fids:
+                fids[action.name] = _make_action_id(action.name, filepath, _build_id)
+            action_id = fids[action.name]
+
             try:
                 exec(compile(action.body, filepath, "exec"), ns)
                 fn = ns.get(action.name)
                 if callable(fn):
-                    # Use the route-specific ID map
-                    fids = _file_action_ids.get(filepath, {})
-                    action_id = fids.get(action.name)
-                    if not action_id:
-                        action_id = _make_action_id(action.name, filepath, action_secret, debug)
-                        fids[action.name] = action_id
-                        _file_action_ids[filepath] = fids
-                    
                     _action_registry[action_id] = fn
                     _id_to_name[action_id] = action.name
+                    # Key param types by action_id to avoid fn-name collisions across files
+                    _action_param_types[action_id] = action.params
             except Exception as e:
                 if _tui:
                     _tui.print_error(f"Could not register action {action.name!r}: {e}")
@@ -289,16 +303,6 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
         "ws.onclose=function(){setTimeout(connect,1000);};"
         "}connect();})();</script>"
     )
-
-    # Collect param type info from every page file.
-    action_param_types: dict[str, list[tuple[str, str]]] = {}
-    for filepath in routes.values():
-        try:
-            mod = parse_pyx_file(filepath)
-            for a in mod.server_actions:
-                action_param_types[a.name] = a.params
-        except Exception:
-            pass
 
     def _rebuild_route(route: str) -> bool:
         filepath = routes[route]
@@ -352,24 +356,32 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # ── FastAPI app ──────────────────────────────────────────────────────────
 
-    # Injected into every served page at response time (never written to disk).
-    # The CSRF token script runs first so JS proxies can read __PYREX_TOKEN.
+    # Injected at response time so values are always fresh (never written to disk).
+    # window.__PYREX_TOKEN — CSRF token; JS action proxies send it back in the
+    #                        x-pyrex-token request header.  Must be readable by
+    #                        same-origin JS — this is standard CSRF token pattern.
+    #                        Empty string in dev mode (CSRF check disabled).
     _TOKEN_SCRIPT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
     # In dev mode also append the hot-reload WebSocket script.
     _PAGE_INJECT = _TOKEN_SCRIPT + ("\n" + _RELOAD_SCRIPT if debug else "")
 
     app = FastAPI()
 
-    # Request logging middleware — skips internal /__pyrex* endpoints
+    # Request logging middleware.
+    # Skips Pyrex-internal paths and browser/OS-injected system requests that
+    # are unrelated to the application (Chrome DevTools probes, favicons, etc.).
+    _LOG_SKIP_PREFIXES = ("/__pyrex", "/.well-known", "/favicon")
+
     if _tui:
         class _LogMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
                 start = time.monotonic()
                 response = await call_next(request)
-                if not request.url.path.startswith("/__pyrex"):
+                path = request.url.path
+                if not any(path.startswith(p) for p in _LOG_SKIP_PREFIXES):
                     _tui.print_request(
                         request.method,
-                        request.url.path,
+                        path,
                         response.status_code,
                         (time.monotonic() - start) * 1000,
                     )
@@ -469,9 +481,11 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
             detail = f"No action: {action_id!r}" if debug else "request failed"
             return JSONResponse({"error": detail}, status_code=400)
 
-        # 5. Validate args via Pydantic against declared type annotations
+        # 5. Validate args via Pydantic against declared type annotations.
+        #    _action_param_types is keyed by opaque action_id (not fn_name) so two
+        #    files with identically-named actions each get the right type rules.
         fn_name = _id_to_name.get(action_id, action_id)
-        param_types = action_param_types.get(fn_name, [])
+        param_types = _action_param_types.get(action_id, [])
         kwargs: dict = {}
         if param_types:
             from pydantic import create_model, ValidationError

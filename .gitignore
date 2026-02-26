@@ -12,6 +12,7 @@ __pycache__/
 app/*.html
 *.html
 
-
+.claude
+memory
 CLAUDE.md
 architecture.md
