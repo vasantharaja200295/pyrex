@@ -356,14 +356,23 @@ def serve(directory: str = "app", port: int = 3000, watch: bool = True,
 
     # ── FastAPI app ──────────────────────────────────────────────────────────
 
-    # Injected at response time so values are always fresh (never written to disk).
-    # window.__PYREX_TOKEN — CSRF token; JS action proxies send it back in the
-    #                        x-pyrex-token request header.  Must be readable by
-    #                        same-origin JS — this is standard CSRF token pattern.
-    #                        Empty string in dev mode (CSRF check disabled).
-    _TOKEN_SCRIPT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
-    # In dev mode also append the hot-reload WebSocket script.
-    _PAGE_INJECT = _TOKEN_SCRIPT + ("\n" + _RELOAD_SCRIPT if debug else "")
+    # _PAGE_INJECT is appended just before </body> at response time (never cached).
+    #
+    # Production: inject the CSRF token so JS action proxies can read it and echo
+    #             it back via the x-pyrex-token header.  The token is a random
+    #             32-char hex string generated once per server run.  It MUST be
+    #             readable by same-origin JS — that is how CSRF tokens work.
+    #             Cross-origin scripts cannot access it due to the browser's
+    #             same-origin policy, which is what prevents CSRF attacks.
+    #
+    # Development: CSRF validation is disabled entirely, so there is nothing to
+    #             inject.  The JS proxy uses  window.__PYREX_TOKEN || ''  so it
+    #             degrades gracefully when the variable is not defined.
+    #             Hot-reload WebSocket script is injected instead.
+    if debug:
+        _PAGE_INJECT = _RELOAD_SCRIPT
+    else:
+        _PAGE_INJECT = f"<script>window.__PYREX_TOKEN={json.dumps(_csrf_token)};</script>"
 
     app = FastAPI()
 
