@@ -60,6 +60,10 @@ class ComponentDef:
     is_server: bool = False     # decorated with @server_component
     is_root: bool = False       # this is the page root
     is_layout: bool = False     # decorated with @layout
+    # Page-level metadata — only meaningful when is_root is True
+    page_title: str = ""        # @page(title="...")
+    page_favicon: str = ""      # @page(favicon="...")  → <link rel="icon">
+    page_meta: dict = field(default_factory=dict)  # @page(meta={"description": "..."})
 
 
 @dataclass
@@ -141,6 +145,11 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
         is_server = 'server_component' in decorators
         is_layout = 'layout' in decorators
 
+        # Extract page metadata from @page(title=...) kwargs (only when is_root)
+        page_title, page_favicon, page_meta = (
+            _extract_page_meta(node.decorator_list) if is_root else ("", "", {})
+        )
+
         params = [arg.arg for arg in node.args.args]
 
         # Extract the JSX string from the return statement
@@ -173,6 +182,9 @@ def _extract_components(source: str, jsx_store: dict) -> list[ComponentDef]:
             is_server=is_server,
             is_root=is_root,
             is_layout=is_layout,
+            page_title=page_title,
+            page_favicon=page_favicon,
+            page_meta=page_meta,
         )
         components.append(comp)
 
@@ -412,9 +424,56 @@ def _extract_server_actions(tree: ast.Module) -> list[ServerAction]:
     return actions
 
 
+def _extract_page_meta(decorator_list: list) -> tuple[str, str, dict]:
+    """
+    Parse keyword arguments from a @page(...) decorator.
+
+    Returns (title, favicon, meta_dict).  Only string constant values are
+    accepted — dynamic expressions are ignored so the parser stays simple.
+
+    Supported kwargs:
+      title   — str, sets the <title> tag
+      favicon — str, href for <link rel="icon">
+      meta    — dict[str, str], each key/value becomes <meta name="k" content="v">
+
+    Example:
+        @page(
+            title="Home — My App",
+            favicon="/favicon.ico",
+            meta={"description": "Welcome", "og:image": "/og.png"},
+        )
+    """
+    for d in decorator_list:
+        if not isinstance(d, ast.Call):
+            continue
+        if _get_decorator_name(d) != 'page':
+            continue
+
+        title = ""
+        favicon = ""
+        meta: dict[str, str] = {}
+
+        for kw in d.keywords:
+            if kw.arg == 'title' and isinstance(kw.value, ast.Constant):
+                title = str(kw.value.value)
+            elif kw.arg == 'favicon' and isinstance(kw.value, ast.Constant):
+                favicon = str(kw.value.value)
+            elif kw.arg == 'meta' and isinstance(kw.value, ast.Dict):
+                for k, v in zip(kw.value.keys, kw.value.values):
+                    if isinstance(k, ast.Constant) and isinstance(v, ast.Constant):
+                        meta[str(k.value)] = str(v.value)
+
+        return title, favicon, meta
+
+    return "", "", {}
+
+
 def _get_decorator_name(decorator) -> str:
     if isinstance(decorator, ast.Name):
         return decorator.id
     if isinstance(decorator, ast.Attribute):
         return decorator.attr
+    if isinstance(decorator, ast.Call):
+        # @page(title="...") — the decorator is a Call whose func is the real name
+        return _get_decorator_name(decorator.func)
     return ""

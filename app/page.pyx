@@ -18,7 +18,14 @@ def StatCard(label, value, unit):
 
 # ── Root page: demonstrates all expression features ───────────────────────────
 
-@page
+@page(title="Home — My App",
+    favicon="/static/favicon.ico",
+    meta={
+        "description": "Welcome to my Pyrex app",
+        "og:title": "Home — My App",
+        "og:image": "/static/og.png",
+
+    },)
 def App():
     count, set_count = use_state(0)
 

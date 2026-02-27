@@ -10,9 +10,38 @@ import functools
 import inspect
 
 
-def page(fn):
-    """Mark a component as the root page rendered by the transpiler."""
-    return fn
+def page(fn=None, *, title="", favicon="", meta=None):
+    """
+    Mark a component as the root page rendered by the transpiler.
+
+    Optional keyword arguments set the page's HTML <head> metadata:
+
+      title   — text for the <title> tag (default: "Pyrex App")
+      favicon — href for <link rel="icon"> (omitted if empty)
+      meta    — dict of name → content pairs; each entry becomes
+                <meta name="..." content="...">
+
+    Usage — no args (uses framework defaults):
+        @page
+        def Home(): ...
+
+    Usage — with metadata:
+        @page(
+            title="Home — My App",
+            favicon="/favicon.ico",
+            meta={"description": "Welcome", "og:image": "/og.png"},
+        )
+        def Home(): ...
+    """
+    def _decorator(f):
+        return f
+
+    # @page with no parentheses — fn is the decorated function itself
+    if fn is not None:
+        return fn
+
+    # @page(...) — return the actual decorator
+    return _decorator
 
 
 def component(fn):

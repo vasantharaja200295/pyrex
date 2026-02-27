@@ -350,6 +350,19 @@ async function {action.name}({param_list}) {{
         idiomorph_tag = '<script defer src="https://cdn.jsdelivr.net/npm/idiomorph@0.3.0/dist/idiomorph.js"></script>'
         pyrexjs_tag = '<script defer src="/__pyrex_static/pyrex.js"></script>'
 
+        # ── Page metadata from @page(title=..., favicon=..., meta={...}) ────
+        root_comp = self.component_map.get(self.module.root_component)
+        page_title   = (root_comp.page_title   if root_comp and root_comp.page_title   else "Pyrex App")
+        page_favicon = (root_comp.page_favicon if root_comp and root_comp.page_favicon else "")
+        page_meta    = (root_comp.page_meta    if root_comp and root_comp.page_meta    else {})
+
+        # Build the extra <head> lines for favicon + meta tags
+        extra_head = ""
+        if page_favicon:
+            extra_head += f'  <link rel="icon" href="{_escape_html(page_favicon)}" />\n'
+        for name, content in page_meta.items():
+            extra_head += f'  <meta name="{_escape_html(name)}" content="{_escape_html(content)}" />\n'
+
         rest = scripts.replace(alpine_tag, "").strip()
         head_content = f"  {alpine_tag}\n  {idiomorph_tag}"
         if rest:
@@ -360,8 +373,8 @@ async function {action.name}({param_list}) {{
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Pyrex App</title>
-  <style>
+  <title>{_escape_html(page_title)}</title>
+{extra_head}  <style>
     *, *::before, *::after {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: system-ui, sans-serif; }}
   </style>
