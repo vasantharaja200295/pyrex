@@ -1,0 +1,10 @@
+from pyrex import page
+
+@page
+def ProfileMe():
+    return (
+        <div style="max-width:740px;margin:2rem auto;padding:0 1rem;">
+            <h1>Profile Page</h1>
+            <p>User profile content here.</p>
+        </div>
+    )
