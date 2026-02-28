@@ -1,47 +1,16 @@
-from pyrex import page, component, useState
+from pyrex import page
 
-@component
-def Counter():
-    count, setCount = useState(0)
 
-    return (
-        <div style="display:flex;align-items:center;gap:1rem;">
-            <button onClick={lambda: setCount(count - 1)} style="width:36px;height:36px;border:none;border-radius:6px;background:#f1f5f9;font-size:1.25rem;cursor:pointer;">-</button>
-            <span style="font-size:1.5rem;font-weight:700;color:#0f172a;min-width:2rem;text-align:center;">{count}</span>
-            <button onClick={lambda: setCount(count + 1)} style="width:36px;height:36px;border:none;border-radius:6px;background:#f1f5f9;font-size:1.25rem;cursor:pointer;">+</button>
-        </div>
-    )
-
-@page(
-    title="Home — My App",
-    favicon="/static/dinosaur.png",
-    meta={
-        "description": "Welcome to my Pyrex app",
-        "og:title": "Home — My App",
-    },
-)
+@page
 def App():
-    name, setName = useState("")
-
     return (
-        <div style="max-width:740px;margin:2rem auto;padding:0 1rem;">
-            <section>
-                <h2 style="font-size:1rem;font-weight:700;color:#475569;margin:0 0 .5rem;">useState reactive counter</h2>
-                <div style="background:white;border-radius:8px;padding:1.25rem 1.5rem;box-shadow:0 1px 4px rgba(0,0,0,.08);">
-                    <Counter />
-                </div>
-            </section>
+        <div class='flex-col items-center justify-center gap-5'>
 
-            <section style="margin-top:2rem;">
-                <h2 style="font-size:1rem;font-weight:700;color:#475569;margin:0 0 .5rem;">Name input</h2>
-                <div style="background:white;border-radius:8px;padding:1.25rem 1.5rem;box-shadow:0 1px 4px rgba(0,0,0,.08);">
-                    <input
-                        placeholder="Your name"
-                        onInput={lambda e: setName(e.target.value)}
-                        style="padding:.5rem .75rem;border:1px solid #e2e8f0;border-radius:6px;font-size:.9rem;"
-                    />
-                    <p style="margin:.75rem 0 0;color:#334155;">Hello, {name}!</p>
-                </div>
-            </section>
+            <p class='font-silkscreen font-bold text-4xl content-center'>PyRex</p>
+            <div class='text-sm'>
+                <p>1. Get started by editing <code class='ml-1'>app/page.px</code></p>
+                <p>2. Save and see your changes instantly</p>
+            </div>
+
         </div>
     )

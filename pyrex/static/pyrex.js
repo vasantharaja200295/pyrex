@@ -166,9 +166,7 @@
 
       ws.onmessage = function (e) {
         if (e.data !== 'reload') return;
-        navigate(location.href, false).catch(function () {
-          location.reload();
-        });
+        location.reload();
       };
 
       ws.onclose = function () {

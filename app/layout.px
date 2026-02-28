@@ -1,27 +1,9 @@
 from pyrex import layout, component, useState
 
-@component
-def Header():
-    count, setCount = useState(0)
-    return (
-        <header style="background:#0f172a;color:white;padding:1rem 2rem;display:flex;align-items:center;gap:1rem;">
-            <span style="font-size:1.5rem;font-weight:700;">🔥 Pyrex</span>
-            <span style="color:#94a3b8;font-size:0.9rem;">Python → HTML Framework</span>
-            <a href="/" style="color:#94a3b8;font-size:0.9rem;">Home</a>
-            <a href="/about" style="color:#94a3b8;font-size:0.9rem;">About</a>
-            <a href="/profile/me" style="color:#94a3b8;font-size:0.9rem;">Profile</a>
-            <a href="/actions" style="color:#94a3b8;font-size:0.9rem;">Actions</a>
-            <a href="/tasks" style="color:#94a3b8;font-size:0.9rem;">Tasks</a>
-        </header>
-    )
-
 @layout
 def Layout(children=None):
     return (
-        <div class=" h-full w-full bg-red-400">
-            <Header />
-            <div class=" h-full w-full bg-yellow-500">
-                <main>{children}</main>
-            </div>
+        <div class=" h-[100vh] w-full bg-neutral-900 font-inter text-white items-center justify-center flex">
+            <main>{children}</main>
         </div>
     )

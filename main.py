@@ -1,7 +1,7 @@
 from pyrex import Pyrex
 
 app = Pyrex()
-app.config(styling="tailwind", google_fonts=['Manrope', 'Inter'])
+app.config(styling="tailwind", google_fonts=['Inter', "Silkscreen"])
 
 
 # @app.on_startup
