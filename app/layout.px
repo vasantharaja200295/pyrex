@@ -11,6 +11,7 @@ def Header():
             <a href="/about" style="color:#94a3b8;font-size:0.9rem;">About</a>
             <a href="/profile/me" style="color:#94a3b8;font-size:0.9rem;">Profile</a>
             <a href="/actions" style="color:#94a3b8;font-size:0.9rem;">Actions</a>
+            <a href="/tasks" style="color:#94a3b8;font-size:0.9rem;">Tasks</a>
             <div style="display:flex;align-items:center;gap:1rem;">
             <button onClick={lambda: setCount(count - 1)} style="width:36px;height:36px;border:none;border-radius:6px;background:#f1f5f9;font-size:1.25rem;cursor:pointer;">-</button>
             <span style="font-size:1.5rem;font-weight:700;color:white;min-width:2rem;text-align:center;">{count}</span>

@@ -48,8 +48,10 @@ def _load_main_config() -> None:
 
 
 def _parse_serve_args(rest: list) -> dict:
-    """Parse positional and --flag arguments for `pyrex serve`."""
-    cfg = {"directory": "app", "port": 3000, "mode": "development", "extra_env": None}
+    """Parse positional and --flag arguments for `pyrex serve`.
+    port and mode are None when not explicitly set — resolved later from env.
+    """
+    cfg = {"directory": "app", "port": None, "mode": None, "extra_env": None}
     i = 0
     while i < len(rest):
         arg = rest[i]
@@ -132,8 +134,6 @@ def _cmd_serve(rest: list):
 
     cfg       = _parse_serve_args(rest)
     directory = cfg["directory"]
-    port      = cfg["port"]
-    mode      = cfg["mode"]
     extra_env = cfg["extra_env"]
 
     if not os.path.isdir(directory):
@@ -141,12 +141,20 @@ def _cmd_serve(rest: list):
         print("Create an app/ directory or pass a custom path: pyrex serve <dir>")
         sys.exit(1)
 
-    # Auto-load main.py config (app.config() calls) without running app.run()
-    # Safe because app.run() is always guarded by `if __name__ == "__main__"`
+    # Apply main.py config (app.config() calls) without running app.run()
     _load_main_config()
 
-    # Load .env files before starting so all vars are in os.environ
+    # Load base .env first so PYREX_MODE and PORT are available as defaults
+    load_env_files(root_dir=".", mode="")
+
+    # Resolve mode: --mode flag > PYREX_MODE env > "development"
+    mode = cfg["mode"] or _MODE_ALIASES.get(os.environ.get("PYREX_MODE", ""), None) or "development"
+
+    # Full env load for this mode (idempotent — already-set vars are skipped)
     env_files = load_env_files(root_dir=".", mode=mode, extra=extra_env)
+
+    # Resolve port: --port flag > PORT env > 3000
+    port = cfg["port"] if cfg["port"] is not None else int(os.environ.get("PORT", "3000"))
 
     # Try TUI; fall back to plain text if rich isn't installed
     try:

@@ -14,7 +14,7 @@ def Counter():
 
 @page(
     title="Home — My App",
-    favicon="/static/favicon.ico",
+    favicon="/static/dinosaur.png",
     meta={
         "description": "Welcome to my Pyrex app",
         "og:title": "Home — My App",

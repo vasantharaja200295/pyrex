@@ -87,6 +87,26 @@ class StateVar:
         return self._value == other
     def __hash__(self): return hash(self._value)
 
+    def __getattr__(self, attr: str):
+        """Allow task.title → StateVar("task.title", value) for x-for templates."""
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        name  = object.__getattribute__(self, "_name")
+        value = object.__getattribute__(self, "_value")
+        nested = value.get(attr) if isinstance(value, dict) else getattr(value, attr, None)
+        return StateVar(f"{name}.{attr}", nested)
+
+    def __getitem__(self, key):
+        """Allow task['title'] → StateVar("task.title", value)."""
+        name  = object.__getattribute__(self, "_name")
+        value = object.__getattribute__(self, "_value")
+        try:
+            nested = value[key]
+        except (KeyError, IndexError, TypeError):
+            nested = None
+        js_key = f".{key}" if isinstance(key, str) else f"[{key}]"
+        return StateVar(f"{name}{js_key}", nested)
+
 
 class StateSetter:
     """

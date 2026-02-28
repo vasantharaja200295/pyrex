@@ -309,15 +309,28 @@ class Pyrex:
         self._shutdown.append(fn)
         return fn
 
-    def run(self, directory: str = "app", port: int = 3000, watch: bool = True,
-            mode: str = "development", secret_key: str = ""):
+    def run(self, directory: str = "app", port: int | None = None,
+            watch: bool = True, mode: str | None = None, secret_key: str = ""):
+        import os
+        from pyrex.env_loader import load_env_files
+
+        # Determine mode first so the right .env.{mode} file is loaded
+        _mode = mode or os.environ.get("PYREX_MODE", "development")
+
+        # Load env files (sets PORT, PYREX_SECRET_KEY, etc. into os.environ)
+        load_env_files(root_dir=".", mode=_mode)
+
+        # Read remaining config from env (env files have now been applied)
+        _port   = port if port is not None else int(os.environ.get("PORT", "3000"))
+        _secret = secret_key or os.environ.get("PYREX_SECRET_KEY", "")
+
         from pyrex.engine import serve
         serve(
             directory,
-            port=port,
+            port=_port,
             watch=watch,
             startup_hooks=self._startup,
             shutdown_hooks=self._shutdown,
-            mode=mode,
-            secret_key=secret_key,
+            mode=_mode,
+            secret_key=_secret,
         )

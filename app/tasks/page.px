@@ -1,0 +1,100 @@
+from pyrex import page, useState, server_action, useEffect
+from bson import ObjectId
+from lib.db import col
+
+_col = col("tasks")
+
+
+def _all_tasks():
+    rows = _col.find({}, {"_id": 1, "title": 1, "done": 1}).sort("_id", -1)
+    return [{"id": str(r["_id"]), "title": r["title"], "done": bool(r["done"])} for r in rows]
+
+
+@server_action
+async def create_task(title: str):
+    if title.strip():
+        _col.insert_one({"title": title.strip(), "done": False})
+    return _all_tasks()
+
+
+@server_action
+async def toggle_task(id: str):
+    task = _col.find_one({"_id": ObjectId(id)})
+    if task:
+        _col.update_one({"_id": ObjectId(id)}, {"$set": {"done": not task["done"]}})
+    return _all_tasks()
+
+
+@server_action
+async def delete_task(id: str):
+    _col.delete_one({"_id": ObjectId(id)})
+    return _all_tasks()
+
+
+@page(title="Tasks — Pyrex CRUD")
+def Tasks():
+    tasks, setTasks = useState(_all_tasks())
+    newTask, setNewTask = useState("")
+
+    useEffect(())
+
+    async def handleAdd():
+        result = await create_task(title=newTask)
+        setTasks(result)
+        setNewTask("")
+
+    async def handleToggle(id):
+        result = await toggle_task(id=id)
+        setTasks(result)
+
+    async def handleDelete(id):
+        result = await delete_task(id=id)
+        setTasks(result)
+
+    return (
+        <div class="min-h-screen bg-slate-50 py-12 px-4">
+            <div class="max-w-md mx-auto">
+
+                <h1 class="text-3xl font-bold text-slate-800 mb-2">Tasks</h1>
+                <p class="text-slate-500 text-sm mb-8">A simple CRUD demo powered by Pyrex + MongoDB</p>
+
+                <div class="flex gap-2 mb-6">
+                    <input
+                        class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
+                        placeholder="What needs to be done?"
+                        onInput={lambda e: setNewTask(e.target.value)}
+                        value={newTask}
+                    />
+                    <button
+                        class="bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors"
+                        onClick={handleAdd}
+                    >Add</button>
+                </div>
+
+                <ul class="space-y-2">
+                    {[
+                        <li class="flex items-center gap-3 bg-white border border-slate-200 rounded-lg px-4 py-3 shadow-sm hover:border-slate-300 transition-colors">
+                            <input
+                                type="checkbox"
+                                class="w-4 h-4 accent-blue-500 cursor-pointer"
+                                checked={task.done}
+                                onChange={lambda: handleToggle(task.id)}
+                            />
+                            <span class="flex-1 text-sm text-slate-700">{task.title}</span>
+                            <button
+                                class="text-red-400 hover:text-red-600 text-xs font-medium transition-colors"
+                                onClick={lambda: handleDelete(task.id)}
+                            >Delete</button>
+                        </li>
+                        for task in tasks
+                    ]}
+                </ul>
+
+                <p
+                    class="text-center text-slate-400 text-sm mt-10"
+                    x-show="tasks.length === 0"
+                >No tasks yet — add one above!</p>
+
+            </div>
+        </div>
+    )

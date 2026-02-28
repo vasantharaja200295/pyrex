@@ -33,6 +33,16 @@ except Exception:
 
 # ── Action ID helper ──────────────────────────────────────────────────────────
 
+def _annotation_type_name(param: inspect.Parameter) -> str:
+    """Return the string type name for a pydantic field from a parameter annotation."""
+    ann = param.annotation
+    if ann is inspect.Parameter.empty:
+        return "str"
+    if hasattr(ann, "__name__"):
+        return ann.__name__
+    return "str"
+
+
 def _make_action_id(fn_name: str, filepath: str, build_id: str) -> str:
     payload = f"{build_id}:{filepath}:{fn_name}"
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
@@ -287,7 +297,8 @@ def serve(
             try:
                 sig = inspect.signature(orig)
                 _action_param_types[action_id] = [
-                    (p, "str") for p in sig.parameters
+                    (p, _annotation_type_name(sig.parameters[p]))
+                    for p in sig.parameters
                     if p not in ("self", "cls")
                 ]
             except Exception:
@@ -308,6 +319,12 @@ def serve(
             route_cache[route]["html"] = (
                 f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"
             )
+            # Record mtime even on failure so the watcher won't retry until
+            # the file is actually saved again.
+            try:
+                route_cache[route]["mtime"] = os.path.getmtime(filepath)
+            except FileNotFoundError:
+                pass
             if _tui:
                 _tui.print_error(f"Build error in {route}: {e}")
             else:
@@ -364,7 +381,18 @@ def serve(
             status_code=404,
         )
 
-    _LOG_SKIP_PREFIXES = ("/__pyrex", "/.well-known", "/favicon")
+    # ── Static file directories ───────────────────────────────────────────────
+    # app/static/ → /static   (images, fonts, per-app assets)
+    # public/     → /public   (project-root assets, favicons, robots.txt, etc.)
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+    _static_app = Path(directory) / "static"
+    if _static_app.is_dir():
+        app.mount("/static", _StaticFiles(directory=str(_static_app)), name="static")
+    _public = Path(directory).parent / "public"
+    if _public.is_dir():
+        app.mount("/public", _StaticFiles(directory=str(_public)), name="public")
+
+    _LOG_SKIP_PREFIXES = ("/__pyrex", "/.well-known", "/favicon", "/static", "/public")
 
     if _tui:
         class _LogMiddleware(BaseHTTPMiddleware):

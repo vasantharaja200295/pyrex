@@ -15,4 +15,4 @@ app.config(styling="tailwind")
 #     pass
 
 if __name__ == "__main__":
-    app.run(directory="app", port=3000, mode="development", secret_key="3242kffjskldfjfhsdj3242342fd")
+    app.run()  # PORT, PYREX_MODE, PYREX_SECRET_KEY are read from .env

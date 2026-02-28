@@ -329,7 +329,7 @@ def load_px_file(filepath: str, registry: dict) -> dict:
     source = Path(filepath).read_text(encoding="utf-8")
     code = transform_px_source(source, filepath)
 
-    ns: dict = {"__builtins__": __builtins__}
+    ns: dict = {"__builtins__": __builtins__, "__file__": filepath}
     _set_registry(registry)
     try:
         exec(code, ns)
@@ -402,6 +402,10 @@ def register_import_hook(project_root: str | None = None) -> None:
     """
     Register the Pyrex .px import hook on sys.meta_path.
 
+    Also ensures the project root is on sys.path so that plain Python
+    packages inside the project (e.g. lib/, utils/) are importable from
+    any .px file without needing to manipulate sys.path manually.
+
     Call once at startup.  project_root defaults to CWD.
     Idempotent — calling multiple times with the same root is safe.
     """
@@ -411,3 +415,6 @@ def register_import_hook(project_root: str | None = None) -> None:
         if isinstance(finder, _PyrexPxFinder) and str(finder.project_root) == root:
             return  # already registered
     sys.meta_path.insert(0, _PyrexPxFinder(root))
+    # Make the project root importable for plain .py packages (lib/, utils/, …)
+    if root not in sys.path:
+        sys.path.insert(0, root)

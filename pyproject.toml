@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic",
     "python-jsx",
+    "pymongo",
 ]
 
 [project.scripts]

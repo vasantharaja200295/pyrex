@@ -514,6 +514,12 @@ class PyrexClientTranspiler:
                 args_js.append(f"...{self._expr(arg.value)}")
             else:
                 args_js.append(self._expr(arg))
+        # Python kwargs → positional JS args (key dropped, value kept in order)
+        # e.g. create_task(title=newTask) → create_task(this.newTask)
+        # This matches the action proxy signature: async function create_task(title)
+        for kw in node.keywords:
+            if kw.arg:
+                args_js.append(self._expr(kw.value))
         return f"{func_js}({', '.join(args_js)})"
 
     def _dict(self, node: ast.Dict) -> str:
@@ -1054,6 +1060,10 @@ def _py_expr_node_to_js(node: ast.expr) -> str:
                 return f"String({_py_expr_node_to_js(node.args[0])})"
         func = _py_expr_node_to_js(node.func)
         args = [_py_expr_node_to_js(a) for a in node.args]
+        # Python kwargs → positional JS args (key dropped, value kept in order)
+        for kw in node.keywords:
+            if kw.arg:
+                args.append(_py_expr_node_to_js(kw.value))
         return f"{func}({', '.join(args)})"
 
     if isinstance(node, ast.Name):
