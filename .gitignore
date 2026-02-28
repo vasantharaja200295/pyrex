@@ -1,19 +1,59 @@
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv
+venv
+env
 
-# Python bytecode
+# ── Python bytecode ───────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Build output
+# ── Build / packaging ─────────────────────────────────────────────────────────
 *.egg-info/
+dist/
+build/
+*.egg
 
-# Transpiler output
-app/*.html
+# ── Transpiler output (generated HTML — never commit) ─────────────────────────
 *.html
+!pyrex/static/**/*.html
 
-.claude
-memory
+# ── Environment files ─────────────────────────────────────────────────────────
+.env.local
+.env.production
+.env.staging
+.env.*.local
+# .env is committed as a template with safe defaults — do NOT add it here
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── OS / editor junk ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Type checkers / linters ───────────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+
+# ── Claude / internal tooling ─────────────────────────────────────────────────
+.claude/
+memory/
 CLAUDE.md
 architecture.md
-build/

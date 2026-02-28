@@ -12,7 +12,6 @@ Migration note: this engine drives .px files (pyjsx + Alpine).
 import asyncio
 import hashlib
 import inspect
-import json
 import os
 import secrets
 import threading
