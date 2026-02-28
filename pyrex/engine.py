@@ -19,8 +19,11 @@ import threading
 import time
 from pathlib import Path
 
-from pyrex.px_loader import load_px_file
+from pyrex.px_loader import load_px_file, register_import_hook
 from pyrex.transpiler.transpiler import PxTranspiler, _minify_js
+
+# Register the .px import hook so cross-file component/action imports work
+register_import_hook()
 
 try:
     from pyrex import tui as _tui
@@ -51,15 +54,83 @@ def _load_px(filepath: str) -> dict:
     """Load a .px (or .pyx) file and return its populated registry."""
     registry = _new_registry()
     load_px_file(filepath, registry)
+    # Merge in any server actions registered from imported files
+    from pyrex import _imported_server_actions
+    for name, fn in _imported_server_actions.items():
+        registry["server_actions"].setdefault(name, fn)
     return registry
+
+
+# ── Part 3: CSS / Tailwind helpers ────────────────────────────────────────────
+
+def _read_css(path: str | None) -> str:
+    """Read a CSS file and return its content, or '' if not found."""
+    if path and Path(path).exists():
+        return Path(path).read_text(encoding="utf-8")
+    return ""
+
+
+def _read_tailwind_config(project_root: str) -> str:
+    """
+    Try to read tailwind.config.json or tailwind.config.js from project root.
+    Returns a JS expression string (the config object) or ''.
+    """
+    # Prefer JSON — easy to parse
+    json_cfg = Path(project_root) / "tailwind.config.json"
+    if json_cfg.exists():
+        return json_cfg.read_text(encoding="utf-8").strip()
+
+    # Fall back to .js — try to extract the exported object
+    js_cfg = Path(project_root) / "tailwind.config.js"
+    if js_cfg.exists():
+        import re as _re
+        content = js_cfg.read_text(encoding="utf-8").strip()
+        # Handle: module.exports = { ... }
+        m = _re.search(r"module\.exports\s*=\s*(\{[\s\S]*\})", content)
+        if m:
+            return m.group(1)
+        # Handle: tailwind.config = { ... }  (CDN-style config file)
+        m = _re.search(r"tailwind\.config\s*=\s*(\{[\s\S]*\})", content)
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def _make_transpiler(
+    registry: dict,
+    action_ids: dict[str, str] | None,
+    app_dir: str,
+    route_dir: str | None = None,
+) -> PxTranspiler:
+    """Build a PxTranspiler with CSS / Tailwind info for this route."""
+    from pyrex import _pyrex_config
+
+    globals_css = _read_css(str(Path(app_dir) / "globals.css"))
+    route_css   = _read_css(str(Path(route_dir) / "style.css") if route_dir else None)
+
+    use_tailwind   = _pyrex_config.get("styling") == "tailwind"
+    tailwind_cfg   = _read_tailwind_config(str(Path(app_dir).parent)) if use_tailwind else ""
+
+    return PxTranspiler(
+        registry,
+        action_ids=action_ids,
+        globals_css=globals_css,
+        route_css=route_css,
+        use_tailwind=use_tailwind,
+        tailwind_config=tailwind_cfg,
+    )
 
 
 # ── Single-file build (used by `pyrex build`) ─────────────────────────────────
 
 def build_file(filepath: str) -> str:
     """Load a .px file and transpile it to a complete HTML page."""
-    registry = _load_px(filepath)
-    return PxTranspiler(registry).transpile()
+    registry  = _load_px(filepath)
+    app_dir   = str(Path(filepath).parent.parent)   # best-effort guess
+    route_dir = str(Path(filepath).parent)
+    t = _make_transpiler(registry, None, app_dir, route_dir)
+    return t.transpile()
 
 
 def build_source(source: str) -> str:
@@ -82,13 +153,16 @@ def build_route(
     page_filepath: str,
     layout_filepath: str | None = None,
     action_ids: dict[str, str] | None = None,
+    app_dir: str = "",
 ) -> str:
     """
     Transpile a page.px, optionally wrapped in a layout component.
     action_ids maps each @server_action name to its opaque dispatch ID.
     """
     page_registry = _load_px(page_filepath)
-    t = PxTranspiler(page_registry, action_ids=action_ids)
+    _app_dir   = app_dir or str(Path(page_filepath).parent.parent)
+    _route_dir = str(Path(page_filepath).parent)
+    t = _make_transpiler(page_registry, action_ids, _app_dir, _route_dir)
 
     if not layout_filepath or not Path(layout_filepath).exists():
         return t.transpile()
@@ -229,7 +303,7 @@ def serve(
         fids = _file_action_ids.get(filepath, {})
 
         try:
-            html = build_route(filepath, layout_path, action_ids=fids)
+            html = build_route(filepath, layout_path, action_ids=fids, app_dir=directory)
         except Exception as e:
             route_cache[route]["html"] = (
                 f"<pre style='color:red'>Build error in {route}:\n{e}</pre>"

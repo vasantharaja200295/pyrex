@@ -12,6 +12,7 @@ during execution so the transpiler can later emit Alpine HTML.
 """
 from __future__ import annotations
 import contextvars
+from typing import Any
 
 
 # ── Per-component execution contexts ─────────────────────────────────────────
@@ -21,10 +22,21 @@ _state_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "pyrex_state", default=None
 )
 
-# Maps handler_name → {"source": python_source_str}
+# Maps handler_name → {"source": python_source_str, "fn": callable}
 _handler_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "pyrex_handlers", default=None
 )
+
+# Maps var_name → store_name  (populated by useStore())
+_store_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "pyrex_stores", default=None
+)
+
+
+# ── Global store registry — all createStore() calls land here ─────────────────
+
+# store_name → PyrexStore  (populated at import time by createStore())
+_registered_stores: dict[str, "PyrexStore"] = {}
 
 
 # ── Node types ────────────────────────────────────────────────────────────────
@@ -127,6 +139,133 @@ class PyrexTernary:
         self.cond_expr = cond_expr
         self.true_node = true_node
         self.false_node = false_node
+
+
+class JsRaw:
+    """
+    Sentinel returned by js() when used in JSX (not inside a handler body).
+    The transpiler emits its content as an inline <script> tag.
+    """
+    __slots__ = ("content",)
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+class RefVar:
+    """
+    Sentinel returned by useRef().  Carries the variable name the developer
+    assigned it to (injected by the AST transformer, same technique as useState).
+    When the transpiler sees ref={refVar} in JSX props it emits x-ref="name".
+    """
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str = ""):
+        self._name = name
+
+    def __repr__(self) -> str:
+        return f"RefVar({self._name!r})"
+
+
+class PyrexStore:
+    """
+    A global reactive store created by createStore().
+    Carries the store name and its initial state dict.
+    """
+    __slots__ = ("_name", "_state")
+
+    def __init__(self, name: str, state: dict):
+        self._name = name
+        self._state = dict(state)
+
+
+class StoreAttr:
+    """
+    Represents a property path into a Pyrex store.
+
+    Returned when attribute access is performed on a StoreProxy or another
+    StoreAttr.  The transpiler converts this to:
+      - JSX child:  <span x-text="$store.name.attr">
+      - JSX prop:   :prop="$store.name.attr"
+      - Handler:    Alpine.store('name').attr   (via PyrexClientTranspiler)
+    """
+    def __init__(self, store_name: str, attr_path: str, value: Any = None):
+        object.__setattr__(self, "_store_name", store_name)
+        object.__setattr__(self, "_attr_path", attr_path)
+        object.__setattr__(self, "_value", value)
+
+    @property
+    def _alpine_ref(self) -> str:
+        return f"$store.{self._store_name}.{self._attr_path}"
+
+    # Proxy bool so it works in Python conditionals during SSR
+    def __bool__(self):
+        return bool(self._value)
+
+    def __str__(self):
+        return str(self._value) if self._value is not None else ""
+
+    def __repr__(self):
+        return repr(self._value)
+
+    def __len__(self):
+        return len(self._value) if self._value else 0
+
+    def __iter__(self):
+        return iter(self._value) if self._value else iter([])
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        store_name = object.__getattribute__(self, "_store_name")
+        attr_path  = object.__getattribute__(self, "_attr_path")
+        value      = object.__getattribute__(self, "_value")
+        nested = value.get(attr) if isinstance(value, dict) else None
+        return StoreAttr(store_name, f"{attr_path}.{attr}", nested)
+
+    def __setattr__(self, attr, value):
+        if attr.startswith("_"):
+            object.__setattr__(self, attr, value)
+        # Store mutation during SSR is a no-op — Alpine handles it in browser
+
+
+class StoreProxy:
+    """
+    Returned by useStore(cartStore).  Attribute access returns StoreAttr
+    sentinels that the transpiler converts to $store.name.attr references.
+    """
+    def __init__(self, store_name: str, state: dict):
+        object.__setattr__(self, "_store_name", store_name)
+        object.__setattr__(self, "_state", state)
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        store_name = object.__getattribute__(self, "_store_name")
+        state      = object.__getattribute__(self, "_state")
+        return StoreAttr(store_name, attr, state.get(attr))
+
+    def __setattr__(self, attr, value):
+        if attr.startswith("_"):
+            object.__setattr__(self, attr, value)
+        # No-op during SSR
+
+
+class SelectorHelper:
+    """
+    Passed to the useSelector() selector lambda.  Attribute access returns
+    StoreAttr so the selector result carries the Alpine $store path.
+    """
+    def __init__(self, store_name: str, state: dict):
+        object.__setattr__(self, "_store_name", store_name)
+        object.__setattr__(self, "_state", state)
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        store_name = object.__getattribute__(self, "_store_name")
+        state      = object.__getattribute__(self, "_state")
+        return StoreAttr(store_name, attr, state.get(attr))
 
 
 # ── Core jsx() function ───────────────────────────────────────────────────────

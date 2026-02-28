@@ -7,16 +7,27 @@ Handles loading, transforming, and executing .px files:
   2. Inject automatic imports (jsx, pyrex helpers)
   3. Transform JSX → Python via pyjsx.transpile()
   4. Apply PyrexASTTransformer:
-       - useState(init) → useState(init, _var_name="x", _setter_name="setX")
-       - onClick={lambda:…} → onClick={__pyrex_handler(lambda:…, "lambda:…")}
-       - [jsx(…) for x in state_var] → __pyrex_list_comp(…)
-       - jsx(…) if cond else jsx(…) → __pyrex_ternary(…)
-       - async def handler(): … → handler(); __pyrex_register_handler(…)
+       - useState(init)      → useState(init, _var_name="x", _setter_name="setX")
+       - useRef()            → useRef(_ref_name="x")
+       - useStore(store)     → useStore(store, _var_name="x")
+       - onClick={lambda:…}  → onClick={__pyrex_handler(lambda:…, "lambda:…")}
+       - [jsx(…) for x in s] → __pyrex_list_comp(…)
+       - jsx(…) if c else j  → __pyrex_ternary(…)
+       - async def handler() → handler(); __pyrex_register_handler(…)
   5. compile() and exec() in a controlled namespace
+
+Cross-file imports:
+  PyrexImporter registers itself on sys.meta_path so that any .px file
+  imported with a standard Python import statement is automatically
+  processed through the full Pyrex transform pipeline.
 """
 
 from __future__ import annotations
 import ast
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import sys
 import threading
 from pathlib import Path
 
@@ -59,23 +70,30 @@ class PyrexASTTransformer(ast.NodeTransformer):
     """
     Post-pyjsx AST transformation that enables Pyrex's Alpine reactivity.
 
-    Runs on the Python AST produced by pyjsx.transpile().  All of these
-    transforms are purely syntactic — they change what functions are called,
-    not the developer's intent.
+    Runs on the Python AST produced by pyjsx.transpile().  All transforms
+    are purely syntactic — they change what functions are called, not the
+    developer's intent.
     """
 
-    # ── useState tuple unpacking ──────────────────────────────────────────────
+    # ── Simple assignment hooks: useState / useRef / useStore ─────────────────
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST:
         """
-        Transform:
-            count, setCount = useState(0)
-        Into:
-            count, setCount = useState(0, _var_name="count", _setter_name="setCount")
+        Handle three patterns:
 
-        This lets useState() know the names the developer chose, so it can
-        register them in the per-component state registry.
+        1. Tuple unpack for useState:
+               count, setCount = useState(0)
+           → useState(0, _var_name="count", _setter_name="setCount")
+
+        2. Single-name assign for useRef:
+               inputRef = useRef()
+           → useRef(_ref_name="inputRef")
+
+        3. Single-name assign for useStore:
+               cart = useStore(cartStore)
+           → useStore(cartStore, _var_name="cart")
         """
+        # 1. count, setCount = useState(0)
         if (
             len(node.targets) == 1
             and isinstance(node.targets[0], ast.Tuple)
@@ -92,11 +110,56 @@ class PyrexASTTransformer(ast.NodeTransformer):
                 func=node.value.func,
                 args=node.value.args,
                 keywords=[
-                    ast.keyword(arg="_var_name", value=ast.Constant(var_name)),
+                    ast.keyword(arg="_var_name",    value=ast.Constant(var_name)),
                     ast.keyword(arg="_setter_name", value=ast.Constant(setter_name)),
                 ],
             )
             ast.fix_missing_locations(node.value)
+            return self.generic_visit(node)
+
+        # 2. inputRef = useRef()
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "useRef"
+        ):
+            var_name = node.targets[0].id
+            node.value = ast.Call(
+                func=node.value.func,
+                args=node.value.args,
+                keywords=[
+                    *node.value.keywords,
+                    ast.keyword(arg="_ref_name", value=ast.Constant(var_name)),
+                ],
+            )
+            ast.fix_missing_locations(node.value)
+            return self.generic_visit(node)
+
+        # 3. cart = useStore(cartStore)
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "useStore"
+        ):
+            var_name = node.targets[0].id
+            # Only add _var_name if not already present
+            has_kw = any(kw.arg == "_var_name" for kw in node.value.keywords)
+            if not has_kw:
+                node.value = ast.Call(
+                    func=node.value.func,
+                    args=node.value.args,
+                    keywords=[
+                        *node.value.keywords,
+                        ast.keyword(arg="_var_name", value=ast.Constant(var_name)),
+                    ],
+                )
+                ast.fix_missing_locations(node.value)
+            return self.generic_visit(node)
+
         return self.generic_visit(node)
 
     # ── Event handler lambda wrapping ─────────────────────────────────────────
@@ -177,8 +240,6 @@ class PyrexASTTransformer(ast.NodeTransformer):
                     and isinstance(elt.test, ast.Name)
                 ):
                     cond_name = elt.test.id
-                    # Wrap both branches in lambdas so __pyrex_ternary
-                    # can call them lazily (avoids executing the False branch)
                     true_lam = ast.Lambda(
                         args=ast.arguments(
                             posonlyargs=[], args=[], vararg=None,
@@ -215,7 +276,6 @@ class PyrexASTTransformer(ast.NodeTransformer):
         __pyrex_register_handler(name, fn, source) call so the transpiler
         can later emit the handler as an async method in the x-data object.
         """
-        # First let children transform themselves
         node = self.generic_visit(node)  # type: ignore[assignment]
 
         new_body: list[ast.stmt] = []
@@ -245,24 +305,14 @@ class PyrexASTTransformer(ast.NodeTransformer):
 def transform_px_source(source: str, filepath: str) -> "code":  # type: ignore[name-defined]
     """
     Full transform pipeline for a .px file source string.
-
     Returns a compiled code object ready for exec().
     """
-    # 1. Prepend automatic imports
     full_source = _AUTO_IMPORTS + source
-
-    # 2. JSX → Python via pyjsx
     py_source = pyjsx.transpile(full_source)
-
-    # 3. Parse → AST
     tree = ast.parse(py_source, filename=filepath)
-
-    # 4. Apply Pyrex transforms
     transformer = PyrexASTTransformer()
     tree = transformer.visit(tree)
     ast.fix_missing_locations(tree)
-
-    # 5. Compile
     return compile(tree, filepath, "exec")
 
 
@@ -287,3 +337,77 @@ def load_px_file(filepath: str, registry: dict) -> dict:
         _clear_registry()
 
     return ns
+
+
+# ── Cross-file .px import hook ────────────────────────────────────────────────
+
+class _PyrexPxLoader(importlib.abc.Loader):
+    """Loader that runs the full Pyrex transform pipeline for .px files."""
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+
+    def create_module(self, spec):
+        return None  # use default module creation
+
+    def exec_module(self, module):
+        source = Path(self.filepath).read_text(encoding="utf-8")
+        code = transform_px_source(source, self.filepath)
+
+        # Save the current registry (may be set by a parent .px file that is
+        # importing this one) so we can restore it after this import finishes.
+        prev_registry = _get_registry()
+
+        tmp_registry: dict = {
+            "page_fn": None,
+            "page_meta": {},
+            "layout_fn": None,
+            "components": {},
+            "server_actions": {},
+        }
+        _set_registry(tmp_registry)
+        try:
+            exec(code, vars(module))
+        finally:
+            # Restore the importing file's registry (or None if at top level)
+            _set_registry(prev_registry)
+
+
+class _PyrexPxFinder(importlib.abc.MetaPathFinder):
+    """
+    Meta path finder that intercepts imports of .px files.
+
+    Looks for <module_path>.px relative to the project root (CWD).
+    Standard .py imports are not affected.
+    """
+
+    def __init__(self, project_root: str):
+        self.project_root = Path(project_root)
+
+    def find_spec(self, fullname, path, target=None):
+        parts = fullname.split(".")
+        px_path = self.project_root / Path(*parts).with_suffix(".px")
+        if px_path.exists():
+            spec = importlib.machinery.ModuleSpec(
+                fullname,
+                _PyrexPxLoader(str(px_path)),
+                origin=str(px_path),
+            )
+            spec.has_location = True
+            return spec
+        return None
+
+
+def register_import_hook(project_root: str | None = None) -> None:
+    """
+    Register the Pyrex .px import hook on sys.meta_path.
+
+    Call once at startup.  project_root defaults to CWD.
+    Idempotent — calling multiple times with the same root is safe.
+    """
+    import os
+    root = os.path.abspath(project_root or ".")
+    for finder in sys.meta_path:
+        if isinstance(finder, _PyrexPxFinder) and str(finder.project_root) == root:
+            return  # already registered
+    sys.meta_path.insert(0, _PyrexPxFinder(root))

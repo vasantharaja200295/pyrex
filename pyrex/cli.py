@@ -28,6 +28,25 @@ _MODE_ALIASES = {
 }
 
 
+def _load_main_config() -> None:
+    """
+    Import main.py (without executing the __main__ block) so that any
+    app.config() calls take effect before the server builds routes.
+    """
+    import importlib.util
+    main_path = os.path.join(os.getcwd(), "main.py")
+    if not os.path.exists(main_path):
+        return
+    spec = importlib.util.spec_from_file_location("__pyrex_main_config__", main_path)
+    if spec is None or spec.loader is None:
+        return
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        pass  # main.py errors don't prevent the server from starting
+
+
 def _parse_serve_args(rest: list) -> dict:
     """Parse positional and --flag arguments for `pyrex serve`."""
     cfg = {"directory": "app", "port": 3000, "mode": "development", "extra_env": None}
@@ -121,6 +140,10 @@ def _cmd_serve(rest: list):
         print(f"Error: directory not found: {directory!r}")
         print("Create an app/ directory or pass a custom path: pyrex serve <dir>")
         sys.exit(1)
+
+    # Auto-load main.py config (app.config() calls) without running app.run()
+    # Safe because app.run() is always guarded by `if __name__ == "__main__"`
+    _load_main_config()
 
     # Load .env files before starting so all vars are in os.environ
     env_files = load_env_files(root_dir=".", mode=mode, extra=extra_env)

@@ -7,7 +7,7 @@ def About():
     newTodo, setNewTodo = useState("")
 
     async def addTodo():
-        todos.push(newTodo)
+        setTodos(todos + [newTodo])
         setNewTodo('')
 
     return (

@@ -16,3 +16,4 @@ app/*.html
 memory
 CLAUDE.md
 architecture.md
+build/

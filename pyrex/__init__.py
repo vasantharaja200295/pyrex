@@ -2,12 +2,13 @@
 Pyrex public API
 
 .px files import from here:
-    from pyrex import page, component, layout, useState, useEffect, server_action
+    from pyrex import page, component, layout, useState, useEffect,
+                      useRef, js, createStore, useStore, useSelector,
+                      server_action
 
-All hooks use camelCase to match JSX event prop naming.
+All hooks use camelCase to match JSX convention.
 
-Decorators (@page, @component, @layout, @server_action) register the
-decorated function into the per-execution module registry maintained by
+Decorators register into the per-execution module registry maintained by
 pyrex.px_loader.  This means the engine never has to walk an AST to find
 components — it just reads the registry after exec().
 """
@@ -15,6 +16,19 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+
+
+# ── Module-level config (set by Pyrex.config()) ───────────────────────────────
+
+_pyrex_config: dict = {
+    "styling": "css",   # "css" | "tailwind"
+}
+
+# Server actions registered from imported files (not page-local).
+# When @server_action runs outside of a page load context (i.e. when a
+# standalone .py / .px action file is imported), the action is stored here
+# so the engine can include it in every page's action registry.
+_imported_server_actions: dict[str, callable] = {}
 
 
 # ── Registry access (lazy import to avoid circular deps) ─────────────────────
@@ -87,6 +101,10 @@ def server_action(fn):
     A named JS proxy is auto-generated in served pages.
 
     Both async def and plain def are supported.
+
+    When called outside a page-load context (e.g. from an imported action
+    file), the action is stored in the global _imported_server_actions dict
+    so the engine can still register and serve it.
     """
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -101,6 +119,9 @@ def server_action(fn):
     reg = _get_registry()
     if reg is not None:
         reg.setdefault("server_actions", {})[fn.__name__] = wrapper
+    else:
+        # Imported from a standalone file — register globally
+        _imported_server_actions[fn.__name__] = wrapper
 
     return wrapper
 
@@ -135,16 +156,122 @@ def useState(initial=None, *, _var_name: str = "", _setter_name: str = ""):
 
 def useEffect(fn, deps=None):
     """
-    Register a client-side effect.
-
-    At server render time this is a no-op; the transpiler emits an
-    x-effect or x-init Alpine directive for the callback.
+    Register a client-side effect.  No-op at server render time.
     (Full useEffect support is roadmap — Phase 2 DX.)
     """
     _ = fn, deps
 
 
-# ── Application class (unchanged from v0.1) ───────────────────────────────────
+def useRef(_ref_name: str = ""):
+    """
+    Create a DOM ref.  The AST transformer rewrites:
+        inputRef = useRef()
+    into:
+        inputRef = useRef(_ref_name="inputRef")
+
+    The returned RefVar carries the ref name.  When the transpiler sees
+    ref={inputRef} on a JSX element it emits x-ref="inputRef" on that element.
+    useRef does NOT add anything to the x-data object.
+
+    Inside js() strings, access the element as $refs.inputRef.
+    """
+    from pyrex.jsx_runtime import RefVar
+    return RefVar(_ref_name)
+
+
+def js(code: str) -> "JsRaw":
+    """
+    Raw JavaScript escape hatch.
+
+    Inside a handler body  → emitted verbatim as a JS statement in the
+                              generated x-data method.  Alpine magic
+                              variables ($refs, $store, $el, etc.) work.
+
+    Inside JSX             → emitted as an inline <script> tag.
+
+    Examples:
+        async def handleFocus():
+            js("$refs.inputRef.focus()")          # handler → raw JS stmt
+
+        return (
+            <div>
+                {js("window.scrollTo(0, 0)")}     # JSX → <script> tag
+            </div>
+        )
+    """
+    from pyrex.jsx_runtime import JsRaw
+    return JsRaw(code)
+
+
+# ── Store API ─────────────────────────────────────────────────────────────────
+
+def createStore(name: str, initial_state: dict) -> "PyrexStore":
+    """
+    Create a global reactive store.  Modelled on Zustand.
+
+    The store is shared across all components that import it.  It persists
+    for the lifetime of the tab (same as Alpine.store).
+
+    The generated Alpine initialisation code is:
+        Alpine.store('name', { ...initial_state })
+
+    and is injected into every page's <head>.
+
+    Example:
+        # store/cart.py
+        from pyrex import createStore
+        cartStore = createStore("cart", {"items": [], "count": 0, "total": 0.0})
+    """
+    from pyrex.jsx_runtime import PyrexStore, _registered_stores
+    store = PyrexStore(name, initial_state)
+    _registered_stores[name] = store
+    return store
+
+
+def useStore(store: "PyrexStore", *, _var_name: str = "") -> "StoreProxy":
+    """
+    Access the full state of a store inside a component.
+
+    The AST transformer rewrites:
+        cart = useStore(cartStore)
+    into:
+        cart = useStore(cartStore, _var_name="cart")
+
+    During component execution, records var_name → store_name in _store_ctx
+    so the handler transpiler knows to emit Alpine.store('cart').x for
+    handler bodies, and the JSX renderer emits $store.cart.x for templates.
+
+    Example:
+        cart = useStore(cartStore)
+        return <span>{cart.count} items</span>
+        # → <span><span x-text="$store.cart.count"></span> items</span>
+    """
+    from pyrex.jsx_runtime import StoreProxy, _store_ctx
+    store_reg = _store_ctx.get()
+    if store_reg is not None and _var_name:
+        store_reg[_var_name] = store._name
+    return StoreProxy(store._name, store._state)
+
+
+def useSelector(store: "PyrexStore", selector) -> "StoreAttr":
+    """
+    Read a specific slice of store state.
+
+    The selector lambda receives a helper whose attribute access records
+    the store path.  The result is a StoreAttr whose _alpine_ref property
+    is the full $store.name.attr path.
+
+    Example:
+        count = useSelector(cartStore, lambda s: s.count)
+        return <span>{count}</span>
+        # → <span x-text="$store.cart.count"></span>
+    """
+    from pyrex.jsx_runtime import SelectorHelper
+    helper = SelectorHelper(store._name, store._state)
+    return selector(helper)
+
+
+# ── Application class ─────────────────────────────────────────────────────────
 
 class Pyrex:
     """
@@ -154,9 +281,7 @@ class Pyrex:
         from pyrex import Pyrex
 
         app = Pyrex()
-
-        @app.on_startup
-        async def connect(): ...
+        app.config(styling="tailwind")
 
         if __name__ == "__main__":
             app.run()
@@ -165,6 +290,16 @@ class Pyrex:
     def __init__(self):
         self._startup: list = []
         self._shutdown: list = []
+
+    def config(self, *, styling: str = "css") -> "Pyrex":
+        """
+        Configure application-wide settings.
+
+        styling="css"       — default; inject globals.css and route style.css
+        styling="tailwind"  — also inject the Tailwind CDN script
+        """
+        _pyrex_config["styling"] = styling
+        return self
 
     def on_startup(self, fn):
         self._startup.append(fn)

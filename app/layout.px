@@ -22,9 +22,9 @@ def Header():
 @layout
 def Layout(children=None):
     return (
-        <div style="min-height:100vh;background:#f8fafc;">
+        <div class=" h-full w-full bg-red-400">
             <Header />
-            <div style="padding:20px;background:#f5ebe0;height:100%;width:100%;">
+            <div class=" h-full w-full bg-yellow-500">
                 <main>{children}</main>
             </div>
         </div>
