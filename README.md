@@ -18,7 +18,6 @@ Pyrex is a Python JSX framework where you write components in `.px` files using 
 8. [Shared Layout](#shared-layout)
 9. [Hooks](#hooks)
    - [useState](#usestate)
-   - [useEffect](#useeffect)
    - [useRef](#useref)
    - [createStore / useStore / useSelector](#createstore--usestore--useselector)
    - [js()](#js)
@@ -29,10 +28,9 @@ Pyrex is a Python JSX framework where you write components in `.px` files using 
 14. [Environment Variables](#environment-variables)
 15. [Application Config & Lifecycle](#application-config--lifecycle)
 16. [CLI Reference](#cli-reference)
-17. [Demos Included](#demos-included)
-18. [Syntax: Pyrex vs React](#syntax-pyrex-vs-react)
-19. [Drawbacks & Limitations](#drawbacks--limitations)
-20. [Roadmap](#roadmap)
+17. [Syntax: Pyrex vs React](#syntax-pyrex-vs-react)
+18. [Drawbacks & Limitations](#drawbacks--limitations)
+19. [Roadmap](#roadmap)
 
 ---
 
@@ -54,19 +52,21 @@ Pyrex lets you define a component, call a Python function from inside it via `@s
 ```
 page.px
   │
-  ▼  px_loader.py      Load .px file, run AST transformer
-  │                    (rewrites JSX + hooks into valid Python)
+  ▼  pyjsx.transpile()  JSX → jsx() calls via AST transform
+  │                     (provided by python-jsx — github.com/tomasr8/pyjsx)
+  ▼  px_loader.py       Pyrex AST transformer — rewrites hooks,
+  │                     handlers, list comprehensions
   ▼  pyrex/__init__.py  useState / useRef / useStore etc.
-  │                    register state/handlers into context vars
-  ▼  transpiler.py     Walk JSX tree → Alpine HTML
-  │                    StateVar  → <span x-text="…">
-  │                    Lambda    → Alpine x-data method
-  │                    ListComp  → <template x-for>
+  │                     register state/handlers into context vars
+  ▼  transpiler.py      Walk JSX tree → Alpine HTML
+  │                     StateVar  → <span x-text="…">
+  │                     Lambda    → Alpine x-data method
+  │                     ListComp  → <template x-for>
   ▼
 page.html  (HTML + Alpine.js CDN + inline x-data directives)
 ```
 
-Each `.px` file is valid Python with JSX embedded. The framework's custom loader runs an AST transformer over the file before execution, then the transpiler converts the resulting JSX tree into Alpine.js HTML.
+Each `.px` file is valid Python with JSX embedded. [pyjsx](https://github.com/tomasr8/pyjsx) registers a custom import hook that transforms JSX syntax into `jsx()` calls before Python sees it. Pyrex's loader then applies a second AST pass to rewrite hooks and handlers, and the transpiler converts the resulting tree into Alpine.js HTML.
 
 ---
 
@@ -87,12 +87,6 @@ source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-For the MongoDB tasks demo only:
-
-```bash
-pip install pymongo
-```
-
 ---
 
 ## Project Structure
@@ -106,11 +100,6 @@ my-app/
 ├── app/                 # all routes live here
 │   ├── layout.px        # shared layout — wraps every page
 │   ├── page.px          # route: /
-│   ├── about/
-│   │   └── page.px      # route: /about
-│   ├── profile/
-│   │   └── me/
-│   │       └── page.px  # route: /profile/me
 │   └── static/          # served at /static
 │
 ├── lib/                 # shared Python helpers, importable from any .px file
@@ -259,14 +248,6 @@ def Tasks():
     ...
 ```
 
-### useEffect
-
-Register a client-side effect. Currently no-op — emits no browser code. Full effect support (watching state changes) is planned for Phase 3.
-
-```python
-useEffect(())   # placeholder for Alpine-level watchers
-```
-
 ### useRef
 
 Create a reference to a DOM element. Access it as `$refs.name` inside handlers.
@@ -381,12 +362,14 @@ def Form():
 ```
 
 **How it works:**
+
 - The function runs on the Python server (can use any library, ORM, database).
 - Parameters annotated with `str`, `int`, `float`, `bool` are validated from the POST body.
 - Return values are JSON-serialised or passed back as an HTML string.
 - The auto-generated JS proxy calls `POST /__pyrex/` under the hood.
 
 **Server actions can return:**
+
 - A Python `dict` → serialised to JSON, accessible as a JS object.
 - A `str` → treated as raw HTML and can be written directly into `innerHTML`.
 - A `list` → serialised to a JSON array.
@@ -397,11 +380,11 @@ def Form():
 
 Routing is file-based and automatic. Each `page.px` inside `app/` maps to a URL:
 
-| File                       | Route        |
-| -------------------------- | ------------ |
-| `app/page.px`              | `/`          |
-| `app/about/page.px`        | `/about`     |
-| `app/profile/me/page.px`   | `/profile/me`|
+| File                     | Route         |
+| ------------------------ | ------------- |
+| `app/page.px`            | `/`           |
+| `app/about/page.px`      | `/about`      |
+| `app/profile/me/page.px` | `/profile/me` |
 
 No router configuration required.
 
@@ -431,7 +414,7 @@ Pass font names to `app.config()`:
 
 ```python
 # Simple — loads weights 400 and 700
-app.config(styling="tailwind", google_fonts=["Inter", "Manrope"])
+app.config(styling="tailwind", google_fonts=["Inter", "Silkscreen"])
 
 # Custom weights per font
 app.config(google_fonts={"Inter": [400, 600, 700], "Roboto Mono": [400]})
@@ -479,12 +462,11 @@ return (
 
 Pyrex loads `.env` on startup, then `.env.{mode}` (e.g. `.env.production`) on top of it.
 
-| Variable           | Default                     | Description                              |
-| ------------------ | --------------------------- | ---------------------------------------- |
-| `PORT`             | `3000`                      | HTTP server port                         |
-| `PYREX_MODE`       | `development`               | `development` or `production`            |
-| `PYREX_SECRET_KEY` | —                           | CSRF token secret (set in production)    |
-| `MONGODB_URI`      | `mongodb://localhost:27017` | MongoDB connection string (demo only)    |
+| Variable           | Default       | Description                           |
+| ------------------ | ------------- | ------------------------------------- |
+| `PORT`             | `3000`        | HTTP server port                      |
+| `PYREX_MODE`       | `development` | `development` or `production`         |
+| `PYREX_SECRET_KEY` | —             | CSRF token secret (set in production) |
 
 ---
 
@@ -532,16 +514,6 @@ The dev server hot-reloads on every `.px` save — the browser refreshes automat
 
 ---
 
-## Demos Included
-
-| Route         | What it shows                                          |
-| ------------- | ------------------------------------------------------ |
-| `/`           | Counter (`useState`) + controlled input                |
-| `/about`      | In-memory todo list with list comprehension rendering  |
-| `/profile/me` | Nested route                                           |
-| `/actions`    | `@server_action` — JSON response + HTML string response|
-| `/tasks`      | Full MongoDB CRUD — create, toggle, delete tasks       |
-
 ---
 
 ## Syntax: Pyrex vs React
@@ -550,19 +522,19 @@ This section shows how familiar React patterns map to Pyrex equivalents.
 
 ### File extension
 
-| React         | Pyrex       |
-| ------------- | ----------- |
-| `page.jsx`    | `page.px`   |
-| `page.tsx`    | `page.px`   |
+| React      | Pyrex     |
+| ---------- | --------- |
+| `page.jsx` | `page.px` |
+| `page.tsx` | `page.px` |
 
 ### Imports
 
 ```python
 # React
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useRef } from 'react'
 
 # Pyrex
-from pyrex import page, component, useState, useEffect, useRef
+from pyrex import page, component, useState, useRef
 ```
 
 ### Component definition
@@ -713,7 +685,7 @@ def Layout(children=None):
     return (
         <div>
             <nav>...</nav>
-            <main>{children}</main>
+            <main>{children}</main> # the main tag is must as we reload and update the children of the main tag
         </div>
     )
 ```
@@ -721,8 +693,8 @@ def Layout(children=None):
 ### Raw JavaScript escape hatch
 
 ```python
-# React — dangerouslySetInnerHTML or useEffect with direct DOM access
-useEffect(() => { window.scrollTo(0, 0) }, [])
+# React — dangerouslySetInnerHTML or direct DOM manipulation
+document.getElementById('el').scrollTo(0, 0)
 
 # Pyrex — js() function
 async def handleClick():
@@ -775,10 +747,6 @@ Pages render initial state on the server (including server-side data in `useStat
 
 You cannot write `if condition: return <A /> else return <B />` in JSX. Use Alpine.js `x-show`, CSS `display:none`, or JavaScript ternary patterns instead. Python `if/else` for component branching is not yet supported.
 
-### `useEffect` is currently limited
-
-`useEffect` is registered but does not yet emit Alpine watchers. It is effectively a no-op. Full effect support (watching state changes, cleanup) is planned for Phase 3.
-
 ### Hot reload is a full page refresh
 
 The dev server watches `.px` files and triggers a browser refresh via WebSocket. It is not component-level HMR — the whole page reloads on every save.
@@ -815,14 +783,20 @@ Complex DOM interactions that do not fit the Alpine.js model (e.g. Canvas API, W
 
 ## Roadmap
 
-| Phase         | Goal                                                          | Status      |
-| ------------- | ------------------------------------------------------------- | ----------- |
-| 1 — POC       | Parser, transpiler, `useState`, CLI                           | Done        |
-| 2 — DX        | Hot reload, file routing, `@server_action`, `.env`, Tailwind  | Done        |
-| 3 — Framework | SSR data fetching, form handling, static export, auth helpers | Next        |
-| 4 — Go Port   | Entire parser + transpiler ported to Go — sub-ms build times  | Planned     |
+| Phase         | Goal                                                              | Status |
+| ------------- | ----------------------------------------------------------------- | ------ |
+| 1 — POC       | Parser, transpiler, `useState`, CLI                               | Done   |
+| 2 — DX        | Hot reload, file routing, `@server_action`, `.env`, Tailwind      | Done   |
+| 3 — Framework | SSR data fetching, form handling, static export, auth helpers     | Next   |
+| 4 — Core      | Bug Fixes, adding support for css modules, darkmode lightmode etc | Next   |
 
 The browser output format (HTML + Alpine.js directives) is stable across all phases. Only the server runtime that generates it changes between phases.
+
+## Acknowledgements
+
+Pyrex's JSX support is built on [**pyjsx**](https://github.com/tomasr8/pyjsx) (`python-jsx`) by [tomasr8](https://github.com/tomasr8). PyJSX provides the import hook and AST transformer that allows JSX to be written directly inside `.px` Python files. Without it, the core syntax of Pyrex would not be possible.
+
+Client-side reactivity is powered by [**Alpine.js**](https://alpinejs.dev) by Caleb Porzio.
 
 ---
 
