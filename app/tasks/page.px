@@ -55,8 +55,8 @@ def Tasks():
         <div class="min-h-screen bg-slate-50 py-12 px-4">
             <div class="max-w-md mx-auto">
 
-                <h1 class="text-3xl font-bold text-slate-800 mb-2">Tasks</h1>
-                <p class="text-slate-500 text-sm mb-8">A simple CRUD demo powered by Pyrex + MongoDB</p>
+                <h1 class="text-3xl font-bold text-slate-800 mb-2 font-manrope">Tasks</h1>
+                <p class="text-slate-500 text-sm mb-8 font-inter">A simple CRUD demo powered by Pyrex + MongoDB</p>
 
                 <div class="flex gap-2 mb-6">
                     <input

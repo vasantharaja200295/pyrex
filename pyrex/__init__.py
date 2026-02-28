@@ -22,6 +22,7 @@ import inspect
 
 _pyrex_config: dict = {
     "styling": "css",   # "css" | "tailwind"
+    "google_fonts": None,  # list[str] | dict[str, list[int]] | None
 }
 
 # Server actions registered from imported files (not page-local).
@@ -291,14 +292,30 @@ class Pyrex:
         self._startup: list = []
         self._shutdown: list = []
 
-    def config(self, *, styling: str = "css") -> "Pyrex":
+    def config(
+        self,
+        *,
+        styling: str = "css",
+        google_fonts: "list | dict | None" = None,
+    ) -> "Pyrex":
         """
         Configure application-wide settings.
 
         styling="css"       — default; inject globals.css and route style.css
         styling="tailwind"  — also inject the Tailwind CDN script
+
+        google_fonts        — load fonts from Google Fonts CDN.
+            list form:  google_fonts=["Inter", "Roboto Mono"]
+                        → uses weights 400 and 700 for each font.
+            dict form:  google_fonts={"Inter": [400, 600, 700], "Roboto Mono": [400]}
+                        → custom weight list per font.
+
+            For Tailwind (styling="tailwind"), font family CSS variables are
+            automatically injected into @theme so you can use font-{name}
+            utility classes (e.g. font-inter, font-roboto-mono).
         """
         _pyrex_config["styling"] = styling
+        _pyrex_config["google_fonts"] = google_fonts
         return self
 
     def on_startup(self, fn):

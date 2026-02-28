@@ -541,6 +541,78 @@ class PyrexClientTranspiler:
 
 # ── Main transpiler ───────────────────────────────────────────────────────────
 
+def _google_fonts_import(google_fonts) -> str:
+    """
+    Return a CSS @import url(...) line for Google Fonts, or ''.
+
+    Accepts:
+        list[str]            e.g. ["Inter", "Roboto Mono"]
+                             → uses weights 400 and 700 per font
+        dict[str, list[int]] e.g. {"Inter": [400, 600, 700], "Roboto Mono": [400]}
+                             → custom weight list per font
+
+    The returned string is suitable for prepending to any CSS block:
+
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+    """
+    if not google_fonts:
+        return ""
+
+    if isinstance(google_fonts, list):
+        specs: dict[str, list[int]] = {name: [400, 700] for name in google_fonts}
+    elif isinstance(google_fonts, dict):
+        specs = google_fonts
+    else:
+        return ""
+
+    if not specs:
+        return ""
+
+    parts: list[str] = []
+    for name, weights in specs.items():
+        family = name.replace(" ", "+")
+        wlist = sorted(set(int(w) for w in (weights or [400, 700])))
+        parts.append(f"family={family}:wght@{';'.join(str(w) for w in wlist)}")
+
+    url = "https://fonts.googleapis.com/css2?" + "&".join(parts) + "&display=swap"
+    return f"@import url('{url}');\n"
+
+
+def _google_fonts_tailwind_theme(google_fonts) -> str:
+    """
+    Return a Tailwind v4 @theme block that maps each Google Font to a
+    --font-{name} CSS variable, enabling font-{name} utility classes.
+
+    E.g. "Inter"      → --font-inter: 'Inter', sans-serif;
+         "Roboto Mono" → --font-roboto-mono: 'Roboto Mono', monospace;
+
+    Monospace fonts (name contains "Mono" or "Code") default to monospace;
+    all others default to sans-serif.
+    Returns '' when google_fonts is falsy.
+    """
+    if not google_fonts:
+        return ""
+
+    names: list[str]
+    if isinstance(google_fonts, list):
+        names = google_fonts
+    elif isinstance(google_fonts, dict):
+        names = list(google_fonts.keys())
+    else:
+        return ""
+
+    if not names:
+        return ""
+
+    lines: list[str] = []
+    for name in names:
+        var = name.lower().replace(" ", "-")
+        fallback = "monospace" if any(k in name for k in ("Mono", "Code")) else "sans-serif"
+        lines.append(f"  --font-{var}: '{name}', {fallback};")
+
+    return "@theme {\n" + "\n".join(lines) + "\n}"
+
+
 class PxTranspiler:
     """
     Renders a .px module registry into a complete HTML page.
@@ -561,6 +633,7 @@ class PxTranspiler:
         route_css: str = "",
         use_tailwind: bool = False,
         tailwind_config: str = "",
+        google_fonts=None,
     ):
         self.registry = registry
         self.action_ids = action_ids or {}
@@ -568,6 +641,7 @@ class PxTranspiler:
         self.route_css = route_css
         self.use_tailwind = use_tailwind
         self.tailwind_config = tailwind_config
+        self.google_fonts = google_fonts
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -879,10 +953,22 @@ class PxTranspiler:
                 f'content="{_escape_attr(mcontent)}" />\n'
             )
 
-        # Part 3: CSS injection
+        # Google Fonts — @import url(...) prepended to the relevant CSS block.
+        # For vanilla CSS: prepended to globals.css (or a dedicated <style> block).
+        # For Tailwind:    prepended to the <style type="text/tailwindcss"> block.
+        fonts_import = _google_fonts_import(self.google_fonts)
+
+        # Part 3: CSS injection (vanilla CSS mode)
         css_block = ""
-        if self.globals_css:
-            css_block += f"  <style>{self.globals_css}</style>\n"
+        if not self.use_tailwind:
+            # Prepend font @import to globals_css so it appears first in the sheet.
+            globals_content = (fonts_import + self.globals_css) if self.globals_css else fonts_import
+            if globals_content:
+                css_block += f"  <style>{globals_content}</style>\n"
+        else:
+            # Tailwind mode — still inject route/globals CSS as plain <style> blocks.
+            if self.globals_css:
+                css_block += f"  <style>{self.globals_css}</style>\n"
         if self.route_css:
             css_block += f"  <style>{self.route_css}</style>\n"
 
@@ -890,8 +976,22 @@ class PxTranspiler:
         tailwind_block = ""
         if self.use_tailwind:
             tailwind_block = '  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>\n'
+            # Google Fonts @import must live in a plain <style> block, NOT inside
+            # <style type="text/tailwindcss">.  An external @import url() inside the
+            # tailwindcss block causes the browser CDN to abort scanning and skip
+            # generating utility classes entirely.
+            if fonts_import:
+                tailwind_block += f'  <style>{fonts_import}</style>\n'
+            tw_css_parts: list[str] = []
             if self.tailwind_config:
-                tailwind_block += f"  <style type=\"text/tailwindcss\">{self.tailwind_config}</style>\n"
+                tw_css_parts.append(self.tailwind_config)
+            # @theme variables let users write font-inter, font-roboto-mono, etc.
+            fonts_theme = _google_fonts_tailwind_theme(self.google_fonts)
+            if fonts_theme:
+                tw_css_parts.append(fonts_theme)
+            if tw_css_parts:
+                tw_css = "\n".join(tw_css_parts)
+                tailwind_block += f'  <style type="text/tailwindcss">{tw_css}</style>\n'
 
         # Part 5: Alpine store initialisation
         store_init_js = _build_store_init_js()

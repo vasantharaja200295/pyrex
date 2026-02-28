@@ -120,6 +120,7 @@ def _make_transpiler(
 
     use_tailwind   = _pyrex_config.get("styling") == "tailwind"
     tailwind_cfg   = _read_tailwind_config(str(Path(app_dir).parent)) if use_tailwind else ""
+    google_fonts   = _pyrex_config.get("google_fonts")
 
     return PxTranspiler(
         registry,
@@ -128,6 +129,7 @@ def _make_transpiler(
         route_css=route_css,
         use_tailwind=use_tailwind,
         tailwind_config=tailwind_cfg,
+        google_fonts=google_fonts,
     )
 
 
